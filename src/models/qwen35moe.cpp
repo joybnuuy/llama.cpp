@@ -488,7 +488,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         if (pool_layer.up_exps)      up_exps      = pool_layer.up_exps;
         if (pool_layer.gate_exps)    gate_exps    = pool_layer.gate_exps;
         if (pool_layer.down_exps)    down_exps    = pool_layer.down_exps;
-        if (pool_layer.gate_up_exps) gate_up_exps = pool_layer.gate_up_exps;
+        if (pool_layer.gate_up_exps && model.layers[il].ffn_gate_up_exps) gate_up_exps = pool_layer.gate_up_exps;
         n_expert_eff = expert_pool->pool_size;
     }
 

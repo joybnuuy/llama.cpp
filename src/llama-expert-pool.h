@@ -136,7 +136,8 @@ struct llama_expert_pool {
               ggml_type type_up_exps,
               ggml_type type_gate_exps,
               ggml_type type_down_exps,
-              ggml_type type_gate_up_exps);
+              ggml_type type_gate_up_exps,
+              bool has_gate_up_exps);
     bool is_constrained() const { return state == CONSTRAINED && pool_size > 0; }
     bool is_free_pass() const { return state == FREE_PASS && pool_size > 0; }
 

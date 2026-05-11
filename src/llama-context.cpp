@@ -397,8 +397,10 @@ llama_context::llama_context(
             ggml_type type_gate_exps   = layer0.ffn_gate_exps   ? layer0.ffn_gate_exps->type   : GGML_TYPE_F32;
             ggml_type type_down_exps   = layer0.ffn_down_exps   ? layer0.ffn_down_exps->type   : GGML_TYPE_F32;
             ggml_type type_gate_up_exps = layer0.ffn_gate_up_exps ? layer0.ffn_gate_up_exps->type : GGML_TYPE_F32;
+            bool has_gate_up_exps = layer0.ffn_gate_up_exps != nullptr;
             if (!expert_pool.init(params.moe_pool_size, hparams.n_expert, hparams.n_layer, hparams.n_embd, n_ff_exp,
-                                  buft, type_gate_inp, type_up_exps, type_gate_exps, type_down_exps, type_gate_up_exps)) {
+                                  buft, type_gate_inp, type_up_exps, type_gate_exps, type_down_exps, type_gate_up_exps,
+                                  has_gate_up_exps)) {
                 LLAMA_LOG_WARN("%s: failed to initialize expert pool, disabling\n", __func__);
                 expert_pool.pool_size = 0;
             } else {
@@ -4028,7 +4030,8 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
                                ggml_type type_up_exps,
                                ggml_type type_gate_exps,
                                ggml_type type_down_exps,
-                               ggml_type type_gate_up_exps) {
+                               ggml_type type_gate_up_exps,
+                               bool has_gate_up_exps) {
     if (pool_size_ <= 0 || n_expert_ <= 0 || n_layer_ <= 0 || n_embd_ <= 0 || n_ff_exp_ <= 0) {
         return false;
     }
@@ -4039,10 +4042,12 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     n_embd    = n_embd_;
     n_ff_exp  = n_ff_exp_;
 
+    const int n_tensors_per_layer = has_gate_up_exps ? 5 : 4;
+
     size_t total_size = 0;
 
     ggml_init_params tmp_params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * n_layer * 5,
+        /*.mem_size   =*/ ggml_tensor_overhead() * n_layer * n_tensors_per_layer,
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -4064,14 +4069,16 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
         auto * t_down_exps = ggml_new_tensor_3d(tmp_ctx, type_down_exps, n_ff_exp, n_embd, pool_size);
         total_size += GGML_PAD(ggml_nbytes(t_down_exps), GGML_MEM_ALIGN);
 
-        auto * t_gate_up_exps = ggml_new_tensor_3d(tmp_ctx, type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
-        total_size += GGML_PAD(ggml_nbytes(t_gate_up_exps), GGML_MEM_ALIGN);
+        if (has_gate_up_exps) {
+            auto * t_gate_up_exps = ggml_new_tensor_3d(tmp_ctx, type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
+            total_size += GGML_PAD(ggml_nbytes(t_gate_up_exps), GGML_MEM_ALIGN);
+        }
     }
 
     ggml_free(tmp_ctx);
 
     ggml_init_params ctx_params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * n_layer * 5,
+        /*.mem_size   =*/ ggml_tensor_overhead() * n_layer * n_tensors_per_layer,
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -4109,9 +4116,13 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
         ggml_backend_tensor_alloc(buf.get(), layers[il].down_exps, base + offset);
         offset += GGML_PAD(ggml_nbytes(layers[il].down_exps), GGML_MEM_ALIGN);
 
-        layers[il].gate_up_exps = ggml_new_tensor_3d(ctx.get(), type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
-        ggml_backend_tensor_alloc(buf.get(), layers[il].gate_up_exps, base + offset);
-        offset += GGML_PAD(ggml_nbytes(layers[il].gate_up_exps), GGML_MEM_ALIGN);
+        if (has_gate_up_exps) {
+            layers[il].gate_up_exps = ggml_new_tensor_3d(ctx.get(), type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
+            ggml_backend_tensor_alloc(buf.get(), layers[il].gate_up_exps, base + offset);
+            offset += GGML_PAD(ggml_nbytes(layers[il].gate_up_exps), GGML_MEM_ALIGN);
+        } else {
+            layers[il].gate_up_exps = nullptr;
+        }
 
         pool[il].resize(pool_size, -1);
     }
@@ -4119,8 +4130,8 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     state = FREE_PASS;
     pool_generation = 1;
 
-    LLAMA_LOG_INFO("%s: expert pool initialized: %d layers, pool_size=%d, n_expert=%d, buffer=%.2f MiB\n",
-            __func__, n_layer, pool_size, n_expert, total_size / 1024.0 / 1024.0);
+    LLAMA_LOG_INFO("%s: expert pool initialized: %d layers, pool_size=%d, n_expert=%d, has_gate_up=%d, buffer=%.2f MiB\n",
+            __func__, n_layer, pool_size, n_expert, (int)has_gate_up_exps, total_size / 1024.0 / 1024.0);
 
     return true;
 }
@@ -4149,7 +4160,10 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
     auto copy_expert = [&](ggml_tensor * dst, ggml_tensor * src, int32_t src_id, int32_t dst_slot) {
         if (!dst || !src) return;
         GGML_ASSERT(src->ne[0] == dst->ne[0]);
-        GGML_ASSERT(src->ne[1] == dst->ne[1]);
+        // gate_inp is 2D: expert count is in ne[1]; 3D tensors have expert count in ne[2]
+        if (src->ne[2] > 1) {
+            GGML_ASSERT(src->ne[1] == dst->ne[1]);
+        }
         size_t src_stride = src->ne[2] > 1 ? src->nb[2] : src->nb[1];
         size_t dst_stride = dst->ne[2] > 1 ? dst->nb[2] : dst->nb[1];
         size_t expert_bytes = src->ne[2] > 1 ? src->nb[2] : src->nb[1];

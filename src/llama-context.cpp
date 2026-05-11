@@ -4058,20 +4058,30 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
 
     for (int il = 0; il < n_layer; ++il) {
         auto * t_gate_inp = ggml_new_tensor_2d(tmp_ctx, type_gate_inp, n_embd, pool_size);
-        total_size += GGML_PAD(ggml_nbytes(t_gate_inp), GGML_MEM_ALIGN);
+        size_t sz_gate_inp = GGML_PAD(ggml_nbytes(t_gate_inp), GGML_MEM_ALIGN);
+        total_size += sz_gate_inp;
 
         auto * t_up_exps = ggml_new_tensor_3d(tmp_ctx, type_up_exps, n_embd, n_ff_exp, pool_size);
-        total_size += GGML_PAD(ggml_nbytes(t_up_exps), GGML_MEM_ALIGN);
+        size_t sz_up_exps = GGML_PAD(ggml_nbytes(t_up_exps), GGML_MEM_ALIGN);
+        total_size += sz_up_exps;
 
         auto * t_gate_exps = ggml_new_tensor_3d(tmp_ctx, type_gate_exps, n_embd, n_ff_exp, pool_size);
-        total_size += GGML_PAD(ggml_nbytes(t_gate_exps), GGML_MEM_ALIGN);
+        size_t sz_gate_exps = GGML_PAD(ggml_nbytes(t_gate_exps), GGML_MEM_ALIGN);
+        total_size += sz_gate_exps;
 
         auto * t_down_exps = ggml_new_tensor_3d(tmp_ctx, type_down_exps, n_ff_exp, n_embd, pool_size);
-        total_size += GGML_PAD(ggml_nbytes(t_down_exps), GGML_MEM_ALIGN);
+        size_t sz_down_exps = GGML_PAD(ggml_nbytes(t_down_exps), GGML_MEM_ALIGN);
+        total_size += sz_down_exps;
 
         if (has_gate_up_exps) {
             auto * t_gate_up_exps = ggml_new_tensor_3d(tmp_ctx, type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
-            total_size += GGML_PAD(ggml_nbytes(t_gate_up_exps), GGML_MEM_ALIGN);
+            size_t sz_gate_up = GGML_PAD(ggml_nbytes(t_gate_up_exps), GGML_MEM_ALIGN);
+            total_size += sz_gate_up;
+        }
+
+        if (il == 0) {
+            LLAMA_LOG_INFO("%s: per-layer sizes: gate_inp=%.2f MB, up_exps=%.2f MB, gate_exps=%.2f MB, down_exps=%.2f MB\n",
+                __func__, sz_gate_inp/1048576.0, sz_up_exps/1048576.0, sz_gate_exps/1048576.0, sz_down_exps/1048576.0);
         }
     }
 
@@ -4130,8 +4140,8 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     state = FREE_PASS;
     pool_generation = 1;
 
-    LLAMA_LOG_INFO("%s: expert pool initialized: %d layers, pool_size=%d, n_expert=%d, has_gate_up=%d, buffer=%.2f MiB\n",
-            __func__, n_layer, pool_size, n_expert, (int)has_gate_up_exps, total_size / 1024.0 / 1024.0);
+    LLAMA_LOG_INFO("%s: expert pool initialized: %d layers, pool_size=%d, n_expert=%d, n_embd=%d, n_ff_exp=%d, has_gate_up=%d, buffer=%.2f MiB\n",
+            __func__, n_layer, pool_size, n_expert, n_embd, n_ff_exp, (int)has_gate_up_exps, total_size / 1024.0 / 1024.0);
 
     return true;
 }

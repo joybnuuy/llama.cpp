@@ -374,11 +374,17 @@ llama_context::llama_context(
             LLAMA_LOG_WARN("%s: moe_pool_size (%d) < n_expert_used (%d), disabling expert pool\n", __func__, params.moe_pool_size, hparams.n_expert_used);
         } else {
             const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : hparams.n_ff() / hparams.n_expert_used;
-            // Use the same backend buffer type and tensor types as the model's MoE weights
+            // Pool MUST be on GPU for fast inference, regardless of where the source weights are.
+            // Use --cpu-moe to keep full MoE weights in system RAM; only the pool lives in VRAM.
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_cpu);
+            for (auto * backend : backend_ptrs) {
+                auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+                if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    buft = ggml_backend_get_default_buffer_type(backend);
+                    break;
+                }
+            }
             const auto & layer0 = model.layers[0];
-            ggml_backend_buffer_type_t buft = layer0.ffn_up_exps && layer0.ffn_up_exps->buffer
-                ? ggml_backend_buffer_get_type(layer0.ffn_up_exps->buffer)
-                : ggml_backend_get_default_buffer_type(backend_cpu);
             ggml_type type_gate_inp    = layer0.ffn_gate_inp    ? layer0.ffn_gate_inp->type    : GGML_TYPE_F32;
             ggml_type type_up_exps     = layer0.ffn_up_exps     ? layer0.ffn_up_exps->type     : GGML_TYPE_F32;
             ggml_type type_gate_exps   = layer0.ffn_gate_exps   ? layer0.ffn_gate_exps->type   : GGML_TYPE_F32;
@@ -390,6 +396,8 @@ llama_context::llama_context(
                 expert_pool.pool_size = 0;
             } else {
                 expert_pool.stats.start_sentence(hparams.n_layer, params.moe_pool_size);
+                LLAMA_LOG_INFO("%s: expert pool enabled (pool_size=%d). Use --cpu-moe to keep full MoE weights in system RAM.\n",
+                        __func__, params.moe_pool_size);
             }
         }
     }

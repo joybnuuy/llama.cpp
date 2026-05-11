@@ -474,18 +474,36 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // Use pooled weights in constrained mode
+    ggml_tensor * gate_inp  = model.layers[il].ffn_gate_inp;
+    ggml_tensor * up_exps   = model.layers[il].ffn_up_exps;
+    ggml_tensor * gate_exps = model.layers[il].ffn_gate_exps;
+    ggml_tensor * down_exps = model.layers[il].ffn_down_exps;
+    ggml_tensor * gate_up_exps = model.layers[il].ffn_gate_up_exps;
+    int64_t n_expert_eff = n_expert;
+
+    if (expert_pool && expert_pool->is_constrained()) {
+        const auto & pool_layer = expert_pool->layers[il];
+        if (pool_layer.gate_inp)     gate_inp     = pool_layer.gate_inp;
+        if (pool_layer.up_exps)      up_exps      = pool_layer.up_exps;
+        if (pool_layer.gate_exps)    gate_exps    = pool_layer.gate_exps;
+        if (pool_layer.down_exps)    down_exps    = pool_layer.down_exps;
+        if (pool_layer.gate_up_exps) gate_up_exps = pool_layer.gate_up_exps;
+        n_expert_eff = expert_pool->pool_size;
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+            gate_inp,
+            up_exps,
+            gate_exps,
+            down_exps,
             nullptr,
-            n_expert, n_expert_used,
+            n_expert_eff, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
+            nullptr, gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);

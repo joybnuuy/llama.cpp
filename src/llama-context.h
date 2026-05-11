@@ -38,6 +38,9 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// defined in llama-expert-pool.h (included via llama-graph.h)
+struct llama_expert_pool;
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -351,6 +354,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // MoE expert pool (B2 VRAM-saving sentence-level caching)
+    llama_expert_pool expert_pool;
 
     // perf
     mutable int64_t t_start_us  = 0;

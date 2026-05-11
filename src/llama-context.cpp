@@ -4,6 +4,8 @@
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+
+#include <algorithm>
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -365,6 +367,32 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // init MoE expert pool (B2 sentence-level caching)
+    if (params.moe_pool_size > 0 && hparams.n_expert > 0 && backend_cpu != nullptr) {
+        if (params.moe_pool_size < (int) hparams.n_expert_used) {
+            LLAMA_LOG_WARN("%s: moe_pool_size (%d) < n_expert_used (%d), disabling expert pool\n", __func__, params.moe_pool_size, hparams.n_expert_used);
+        } else {
+            const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : hparams.n_ff() / hparams.n_expert_used;
+            // Use the same backend buffer type and tensor types as the model's MoE weights
+            const auto & layer0 = model.layers[0];
+            ggml_backend_buffer_type_t buft = layer0.ffn_up_exps && layer0.ffn_up_exps->buffer
+                ? ggml_backend_buffer_get_type(layer0.ffn_up_exps->buffer)
+                : ggml_backend_get_default_buffer_type(backend_cpu);
+            ggml_type type_gate_inp    = layer0.ffn_gate_inp    ? layer0.ffn_gate_inp->type    : GGML_TYPE_F32;
+            ggml_type type_up_exps     = layer0.ffn_up_exps     ? layer0.ffn_up_exps->type     : GGML_TYPE_F32;
+            ggml_type type_gate_exps   = layer0.ffn_gate_exps   ? layer0.ffn_gate_exps->type   : GGML_TYPE_F32;
+            ggml_type type_down_exps   = layer0.ffn_down_exps   ? layer0.ffn_down_exps->type   : GGML_TYPE_F32;
+            ggml_type type_gate_up_exps = layer0.ffn_gate_up_exps ? layer0.ffn_gate_up_exps->type : GGML_TYPE_F32;
+            if (!expert_pool.init(params.moe_pool_size, hparams.n_expert, hparams.n_layer, hparams.n_embd, n_ff_exp,
+                                  buft, type_gate_inp, type_up_exps, type_gate_exps, type_down_exps, type_gate_up_exps)) {
+                LLAMA_LOG_WARN("%s: failed to initialize expert pool, disabling\n", __func__);
+                expert_pool.pool_size = 0;
+            } else {
+                expert_pool.stats.start_sentence(hparams.n_layer, params.moe_pool_size);
+            }
+        }
+    }
 }
 
 llama_context::~llama_context() {
@@ -375,6 +403,16 @@ llama_context::~llama_context() {
             LLAMA_LOG_INFO("%s: expert-cache: hits=%" PRId64 " (%.1f%%) misses=%" PRId64 " fate=%" PRId64 " saved=%.1fMB copied=%.1fMB\n",
                 __func__, hits, 100.0 * hits / (hits + misses), misses, fate,
                 saved / 1048576.0, copied / 1048576.0);
+        }
+    }
+    if (expert_pool.pool_size > 0) {
+        uint64_t total = expert_pool.stats.total_free_pass_tokens + expert_pool.stats.total_constrained_tokens;
+        if (total > 0) {
+            LLAMA_LOG_INFO("%s: expert-pool: sentences=%" PRIu64 " free=%" PRIu64 " constrained=%" PRIu64 " (%.1f%% free)\n",
+                __func__, expert_pool.stats.total_sentences,
+                expert_pool.stats.total_free_pass_tokens,
+                expert_pool.stats.total_constrained_tokens,
+                100.0 * expert_pool.stats.total_free_pass_tokens / total);
         }
     }
     if (!model.hparams.no_alloc) {
@@ -1744,6 +1782,86 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
+        // Helper to read back selected expert IDs from the graph
+        auto read_back_experts = [&](std::vector<std::vector<int32_t>> & out) {
+            out.resize(model.hparams.n_layer);
+            for (int il = 0; il < model.hparams.n_layer; ++il) {
+                char name[32];
+                snprintf(name, sizeof(name), "ffn_moe_topk-%d", il);
+                ggml_tensor * node = nullptr;
+                for (int i = 0; i < ggml_graph_n_nodes(res->get_gf()); ++i) {
+                    ggml_tensor * cur_node = ggml_graph_node(res->get_gf(), i);
+                    if (cur_node && strcmp(cur_node->name, name) == 0) {
+                        node = cur_node;
+                        break;
+                    }
+                }
+                if (node) {
+                    int32_t ids[8];
+                    size_t read_bytes = std::min((size_t)(8 * sizeof(int32_t)), ggml_nbytes(node));
+                    ggml_backend_tensor_get(node, ids, 0, read_bytes);
+                    int n_ids = (int)(read_bytes / sizeof(int32_t));
+                    out[il].assign(ids, ids + n_ids);
+                }
+            }
+        };
+
+        // MoE expert pool: accumulate bootstrap tokens, then refresh
+        if (expert_pool.is_free_pass()) {
+            ggml_backend_sched_synchronize(sched.get());
+
+            std::vector<std::vector<int32_t>> selected_experts;
+            read_back_experts(selected_experts);
+
+            expert_pool.accumulate_experts(selected_experts);
+            expert_pool.stats.record_token(true, model.hparams.n_layer, selected_experts, expert_pool.pool);
+            expert_pool.free_pass_remaining--;
+
+            if (expert_pool.free_pass_remaining <= 0) {
+                expert_pool.finalize_pool();
+
+                for (int il = 0; il < model.hparams.n_layer; ++il) {
+                    expert_pool.refresh_layer(il, model.layers[il], expert_pool.pool[il]);
+                }
+
+                expert_pool.state = llama_expert_pool::CONSTRAINED;
+                expert_pool.pool_generation++;  // invalidate graph cache for constrained rebuild
+                LLAMA_LOG_INFO("%s: pool refreshed after %d bootstrap tokens, switching to CONSTRAINED\n",
+                        __func__, expert_pool.bootstrap_n);
+            }
+        }
+
+        // Constrained mode: track stats and watch for sentence boundary
+        if (expert_pool.is_constrained()) {
+            if (expert_pool.pool_size > 0) {
+                ggml_backend_sched_synchronize(sched.get());
+                std::vector<std::vector<int32_t>> selected_experts;
+                read_back_experts(selected_experts);
+                expert_pool.stats.record_token(false, model.hparams.n_layer, selected_experts, expert_pool.pool);
+            }
+
+            bool boundary = false;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                llama_token token = ubatch.token[i];
+                std::string piece = model.vocab.token_to_piece(token);
+                if (!piece.empty() && (piece.back() == '.' || piece.back() == '!' || piece.back() == '?' || piece.back() == '\n')) {
+                    boundary = true;
+                    break;
+                }
+            }
+            if (boundary) {
+                expert_pool.stats.end_sentence();
+                expert_pool.stats.start_sentence(model.hparams.n_layer, expert_pool.pool_size);
+
+                expert_pool.reset_scores();
+                expert_pool.state = llama_expert_pool::FREE_PASS;
+                expert_pool.free_pass_remaining = expert_pool.bootstrap_n;
+                expert_pool.pool_generation++;  // invalidate graph cache for free-pass rebuild
+                LLAMA_LOG_INFO("%s: sentence boundary detected, starting %d-token bootstrap\n",
+                        __func__, expert_pool.bootstrap_n);
+            }
+        }
+
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
 
@@ -2182,7 +2300,9 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.res                  =*/ res,
+        /*.expert_pool          =*/ expert_pool.pool_size > 0 ? &expert_pool : nullptr,
+        /*.expert_pool_generation =*/ expert_pool.pool_generation,
     };
 }
 
@@ -3247,6 +3367,7 @@ llama_context_params llama_context_default_params() {
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.expert_cache_n_slots         =*/ 0,
+        /*.moe_pool_size               =*/ 0,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
@@ -3877,4 +3998,240 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+//
+// MoE expert pool implementation (B2 VRAM-saving sentence-level caching)
+//
+
+bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_embd_, int n_ff_exp_,
+                               ggml_backend_buffer_type_t buft,
+                               ggml_type type_gate_inp,
+                               ggml_type type_up_exps,
+                               ggml_type type_gate_exps,
+                               ggml_type type_down_exps,
+                               ggml_type type_gate_up_exps) {
+    if (pool_size_ <= 0 || n_expert_ <= 0 || n_layer_ <= 0 || n_embd_ <= 0 || n_ff_exp_ <= 0) {
+        return false;
+    }
+
+    pool_size = pool_size_;
+    n_expert  = n_expert_;
+    n_layer   = n_layer_;
+    n_embd    = n_embd_;
+    n_ff_exp  = n_ff_exp_;
+
+    size_t total_size = 0;
+
+    ggml_init_params tmp_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * n_layer * 5,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * tmp_ctx = ggml_init(tmp_params);
+    if (!tmp_ctx) {
+        return false;
+    }
+
+    for (int il = 0; il < n_layer; ++il) {
+        auto * t_gate_inp = ggml_new_tensor_2d(tmp_ctx, type_gate_inp, n_embd, pool_size);
+        total_size += GGML_PAD(ggml_nbytes(t_gate_inp), GGML_MEM_ALIGN);
+
+        auto * t_up_exps = ggml_new_tensor_3d(tmp_ctx, type_up_exps, n_embd, n_ff_exp, pool_size);
+        total_size += GGML_PAD(ggml_nbytes(t_up_exps), GGML_MEM_ALIGN);
+
+        auto * t_gate_exps = ggml_new_tensor_3d(tmp_ctx, type_gate_exps, n_embd, n_ff_exp, pool_size);
+        total_size += GGML_PAD(ggml_nbytes(t_gate_exps), GGML_MEM_ALIGN);
+
+        auto * t_down_exps = ggml_new_tensor_3d(tmp_ctx, type_down_exps, n_ff_exp, n_embd, pool_size);
+        total_size += GGML_PAD(ggml_nbytes(t_down_exps), GGML_MEM_ALIGN);
+
+        auto * t_gate_up_exps = ggml_new_tensor_3d(tmp_ctx, type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
+        total_size += GGML_PAD(ggml_nbytes(t_gate_up_exps), GGML_MEM_ALIGN);
+    }
+
+    ggml_free(tmp_ctx);
+
+    ggml_init_params ctx_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * n_layer * 5,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ctx.reset(ggml_init(ctx_params));
+    if (!ctx) {
+        return false;
+    }
+
+    buf.reset(ggml_backend_buft_alloc_buffer(buft, total_size));
+    if (!buf) {
+        ctx.reset();
+        return false;
+    }
+
+    layers.resize(n_layer);
+    pool.resize(n_layer);
+    expert_scores.resize(n_layer, std::vector<float>(n_expert, 0.0f));
+
+    char * base = (char *)ggml_backend_buffer_get_base(buf.get());
+    size_t offset = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        layers[il].gate_inp = ggml_new_tensor_2d(ctx.get(), type_gate_inp, n_embd, pool_size);
+        ggml_backend_tensor_alloc(buf.get(), layers[il].gate_inp, base + offset);
+        offset += GGML_PAD(ggml_nbytes(layers[il].gate_inp), GGML_MEM_ALIGN);
+
+        layers[il].up_exps = ggml_new_tensor_3d(ctx.get(), type_up_exps, n_embd, n_ff_exp, pool_size);
+        ggml_backend_tensor_alloc(buf.get(), layers[il].up_exps, base + offset);
+        offset += GGML_PAD(ggml_nbytes(layers[il].up_exps), GGML_MEM_ALIGN);
+
+        layers[il].gate_exps = ggml_new_tensor_3d(ctx.get(), type_gate_exps, n_embd, n_ff_exp, pool_size);
+        ggml_backend_tensor_alloc(buf.get(), layers[il].gate_exps, base + offset);
+        offset += GGML_PAD(ggml_nbytes(layers[il].gate_exps), GGML_MEM_ALIGN);
+
+        layers[il].down_exps = ggml_new_tensor_3d(ctx.get(), type_down_exps, n_ff_exp, n_embd, pool_size);
+        ggml_backend_tensor_alloc(buf.get(), layers[il].down_exps, base + offset);
+        offset += GGML_PAD(ggml_nbytes(layers[il].down_exps), GGML_MEM_ALIGN);
+
+        layers[il].gate_up_exps = ggml_new_tensor_3d(ctx.get(), type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
+        ggml_backend_tensor_alloc(buf.get(), layers[il].gate_up_exps, base + offset);
+        offset += GGML_PAD(ggml_nbytes(layers[il].gate_up_exps), GGML_MEM_ALIGN);
+
+        pool[il].resize(pool_size, -1);
+    }
+
+    state = FREE_PASS;
+    pool_generation = 1;
+
+    LLAMA_LOG_INFO("%s: expert pool initialized: %d layers, pool_size=%d, n_expert=%d, buffer=%.2f MiB\n",
+            __func__, n_layer, pool_size, n_expert, total_size / 1024.0 / 1024.0);
+
+    return true;
+}
+
+void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const std::vector<int32_t> & new_pool) {
+    GGML_ASSERT(il >= 0 && il < n_layer);
+    GGML_ASSERT((int)new_pool.size() <= pool_size);
+
+    auto & pl = layers[il];
+
+    // Pre-allocate a single staging buffer sized to the largest expert slice
+    size_t max_expert_bytes = 0;
+    auto update_max = [&](ggml_tensor * t) {
+        if (t) {
+            size_t b = t->ne[2] > 1 ? t->nb[2] : t->nb[1];
+            if (b > max_expert_bytes) max_expert_bytes = b;
+        }
+    };
+    update_max(layer.ffn_gate_inp);
+    update_max(layer.ffn_up_exps);
+    update_max(layer.ffn_gate_exps);
+    update_max(layer.ffn_down_exps);
+    update_max(layer.ffn_gate_up_exps);
+    std::vector<char> tmp(max_expert_bytes);
+
+    auto copy_expert = [&](ggml_tensor * dst, ggml_tensor * src, int32_t src_id, int32_t dst_slot) {
+        if (!dst || !src) return;
+        GGML_ASSERT(src->ne[0] == dst->ne[0]);
+        GGML_ASSERT(src->ne[1] == dst->ne[1]);
+        size_t src_stride = src->ne[2] > 1 ? src->nb[2] : src->nb[1];
+        size_t dst_stride = dst->ne[2] > 1 ? dst->nb[2] : dst->nb[1];
+        size_t expert_bytes = src->ne[2] > 1 ? src->nb[2] : src->nb[1];
+
+        ggml_backend_tensor_get(src, tmp.data(), src_id * src_stride, expert_bytes);
+        ggml_backend_tensor_set(dst, tmp.data(), dst_slot * dst_stride, expert_bytes);
+    };
+
+    for (size_t slot = 0; slot < new_pool.size(); ++slot) {
+        int32_t eid = new_pool[slot];
+        if (eid < 0 || eid >= n_expert) continue;
+
+        copy_expert(pl.gate_inp,     layer.ffn_gate_inp,     eid, slot);
+        copy_expert(pl.up_exps,      layer.ffn_up_exps,      eid, slot);
+        copy_expert(pl.gate_exps,    layer.ffn_gate_exps,    eid, slot);
+        copy_expert(pl.down_exps,    layer.ffn_down_exps,    eid, slot);
+        copy_expert(pl.gate_up_exps, layer.ffn_gate_up_exps, eid, slot);
+    }
+
+    pool[il] = new_pool;
+}
+
+void llama_expert_pool::reset_scores() {
+    for (int il = 0; il < n_layer; ++il) {
+        std::fill(expert_scores[il].begin(), expert_scores[il].end(), 0.0f);
+    }
+}
+
+void llama_expert_pool::accumulate_experts(const std::vector<std::vector<int32_t>> & selected_experts) {
+    GGML_ASSERT((int)selected_experts.size() == n_layer);
+
+    for (int il = 0; il < n_layer; ++il) {
+        for (int32_t eid : selected_experts[il]) {
+            if (eid >= 0 && eid < n_expert) {
+                expert_scores[il][eid] += 1.0f;
+            }
+        }
+    }
+}
+
+void llama_expert_pool::finalize_pool() {
+    for (int il = 0; il < n_layer; ++il) {
+        std::vector<std::pair<float, int32_t>> scored;
+        scored.reserve(n_expert);
+        for (int e = 0; e < n_expert; ++e) {
+            scored.push_back({expert_scores[il][e], e});
+        }
+        std::partial_sort(scored.begin(), scored.begin() + std::min(pool_size, n_expert), scored.end(),
+            [](const auto & a, const auto & b) { return a.first > b.first; });
+
+        std::vector<int32_t> new_pool;
+        new_pool.reserve(pool_size);
+        for (int i = 0; i < std::min(pool_size, n_expert); ++i) {
+            new_pool.push_back(scored[i].second);
+        }
+
+        while ((int)new_pool.size() < pool_size) {
+            new_pool.push_back(-1);
+        }
+
+        pool[il] = new_pool;
+    }
+}
+
+void llama_expert_pool::compute_new_pool(const std::vector<std::vector<int32_t>> & selected_experts) {
+    // Legacy EMA-based single-token pool update.
+    // Not used by the bootstrap flow; kept for compatibility.
+    GGML_ASSERT((int)selected_experts.size() == n_layer);
+
+    const float decay = 0.9f;
+
+    for (int il = 0; il < n_layer; ++il) {
+        for (int e = 0; e < n_expert; ++e) {
+            expert_scores[il][e] *= decay;
+        }
+
+        for (int32_t eid : selected_experts[il]) {
+            if (eid >= 0 && eid < n_expert) {
+                expert_scores[il][eid] += 1.0f;
+            }
+        }
+
+        std::vector<std::pair<float, int32_t>> scored;
+        scored.reserve(n_expert);
+        for (int e = 0; e < n_expert; ++e) {
+            scored.push_back({expert_scores[il][e], e});
+        }
+        std::partial_sort(scored.begin(), scored.begin() + std::min(pool_size, n_expert), scored.end(),
+            [](const auto & a, const auto & b) { return a.first > b.first; });
+
+        std::vector<int32_t> new_pool;
+        new_pool.reserve(pool_size);
+        for (int i = 0; i < std::min(pool_size, n_expert); ++i) {
+            new_pool.push_back(scored[i].second);
+        }
+
+        while ((int)new_pool.size() < pool_size) {
+            new_pool.push_back(-1);
+        }
+
+        pool[il] = new_pool;
+    }
 }

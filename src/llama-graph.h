@@ -527,6 +527,8 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+#include "llama-expert-pool.h"
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -567,6 +569,10 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // MoE expert pool state (for B2 VRAM-saving expert caching)
+    const struct llama_expert_pool * expert_pool = nullptr;
+    uint64_t                           expert_pool_generation = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -621,6 +627,11 @@ struct llm_graph_params {
                     return false;
                 }
             }
+        }
+
+        if (expert_pool != other.expert_pool ||
+            expert_pool_generation != other.expert_pool_generation) {
+            return false;
         }
 
         return
@@ -767,6 +778,8 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    const llama_expert_pool * expert_pool = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

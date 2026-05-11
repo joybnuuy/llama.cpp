@@ -553,6 +553,7 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     int32_t expert_cache_n_slots = 0; // N-slot LRU expert cache: 0=off, -1=dedup-only, N>0=N GPU slots per layer (--expert-cache-slots)
+    int32_t moe_pool_size        = 0; // Max experts per layer in GPU pool for sentence-level caching. 0=disabled (--moe-pool-size)
 
     bool single_turn       = false; // single turn chat conversation
 

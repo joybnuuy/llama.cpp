@@ -1844,6 +1844,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     expert_pool.refresh_layer(il, model.layers[il], expert_pool.pool[il]);
                 }
 
+                // Ensure all GPU copies from refresh_layer complete before next graph
+                ggml_backend_sched_synchronize(sched.get());
+
                 expert_pool.state = llama_expert_pool::CONSTRAINED;
                 expert_pool.pool_generation++;  // invalidate graph cache for constrained rebuild
                 LLAMA_LOG_INFO("%s: pool refreshed after %d bootstrap tokens, switching to CONSTRAINED\n",
@@ -4166,11 +4169,11 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
     update_max(layer.ffn_down_exps);
     update_max(layer.ffn_gate_up_exps);
     std::vector<char> tmp(max_expert_bytes);
+    std::vector<char> verify(max_expert_bytes);
 
     auto copy_expert = [&](ggml_tensor * dst, ggml_tensor * src, int32_t src_id, int32_t dst_slot) {
         if (!dst || !src) return;
         GGML_ASSERT(src->ne[0] == dst->ne[0]);
-        // gate_inp is 2D: expert count is in ne[1]; 3D tensors have expert count in ne[2]
         if (src->ne[2] > 1) {
             GGML_ASSERT(src->ne[1] == dst->ne[1]);
         }
@@ -4191,6 +4194,20 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
         copy_expert(pl.gate_exps,    layer.ffn_gate_exps,    eid, slot);
         copy_expert(pl.down_exps,    layer.ffn_down_exps,    eid, slot);
         copy_expert(pl.gate_up_exps, layer.ffn_gate_up_exps, eid, slot);
+    }
+
+    // Verify gate_inp copy: read back slot 0 and compare with source
+    if (pl.gate_inp && layer.ffn_gate_inp && !new_pool.empty()) {
+        int32_t eid = new_pool[0];
+        size_t row_bytes = layer.ffn_gate_inp->nb[1];
+        ggml_backend_tensor_get(layer.ffn_gate_inp, tmp.data(),  eid * row_bytes, row_bytes);
+        ggml_backend_tensor_get(pl.gate_inp,         verify.data(), 0 * row_bytes, row_bytes);
+        bool ok = (memcmp(tmp.data(), verify.data(), row_bytes) == 0);
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: LAYER %d gate_inp copy verification FAILED for expert %d -> slot 0\n", __func__, il, eid);
+        } else if (il == 0) {
+            LLAMA_LOG_INFO("%s: LAYER %d gate_inp copy verification OK for expert %d -> slot 0\n", __func__, il, eid);
+        }
     }
 
     pool[il] = new_pool;

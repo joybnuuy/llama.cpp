@@ -377,13 +377,20 @@ llama_context::llama_context(
             // Pool MUST be on GPU for fast inference, regardless of where the source weights are.
             // Use --cpu-moe to keep full MoE weights in system RAM; only the pool lives in VRAM.
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_cpu);
-            for (auto * backend : backend_ptrs) {
-                auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+            LLAMA_LOG_INFO("%s: searching for GPU backend in %zu backends...\n", __func__, backend_ptrs.size());
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                auto * backend = backend_ptrs[i];
+                auto dev = ggml_backend_get_device(backend);
+                auto dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                const char * dev_name = dev ? ggml_backend_dev_name(dev) : "null";
+                LLAMA_LOG_INFO("%s: backend[%zu] type=%d name=%s\n", __func__, i, (int)dev_type, dev_name);
                 if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     buft = ggml_backend_get_default_buffer_type(backend);
+                    LLAMA_LOG_INFO("%s: selected GPU backend[%zu] for pool buffer\n", __func__, i);
                     break;
                 }
             }
+            LLAMA_LOG_INFO("%s: pool buffer type name: %s\n", __func__, ggml_backend_buft_name(buft));
             const auto & layer0 = model.layers[0];
             ggml_type type_gate_inp    = layer0.ffn_gate_inp    ? layer0.ffn_gate_inp->type    : GGML_TYPE_F32;
             ggml_type type_up_exps     = layer0.ffn_up_exps     ? layer0.ffn_up_exps->type     : GGML_TYPE_F32;

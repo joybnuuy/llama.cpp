@@ -416,11 +416,14 @@ llama_context::~llama_context() {
     if (expert_pool.pool_size > 0) {
         uint64_t total = expert_pool.stats.total_free_pass_tokens + expert_pool.stats.total_constrained_tokens;
         if (total > 0) {
-            LLAMA_LOG_INFO("%s: expert-pool: sentences=%" PRIu64 " free=%" PRIu64 " constrained=%" PRIu64 " (%.1f%% free)\n",
+            uint64_t selections = expert_pool.stats.total_pool_hits + expert_pool.stats.total_pool_misses;
+            double hit_rate = selections > 0 ? 100.0 * expert_pool.stats.total_pool_hits / selections : 0.0;
+            LLAMA_LOG_INFO("%s: expert-pool: sentences=%" PRIu64 " free=%" PRIu64 " constrained=%" PRIu64 " (%.1f%% free) hit_rate=%.1f%%\n",
                 __func__, expert_pool.stats.total_sentences,
                 expert_pool.stats.total_free_pass_tokens,
                 expert_pool.stats.total_constrained_tokens,
-                100.0 * expert_pool.stats.total_free_pass_tokens / total);
+                100.0 * expert_pool.stats.total_free_pass_tokens / total,
+                hit_rate);
         }
     }
     if (!model.hparams.no_alloc) {

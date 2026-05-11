@@ -57,6 +57,8 @@ struct llama_expert_pool {
         uint64_t total_constrained_tokens   = 0;
         uint64_t total_sentences            = 0;
         uint64_t total_refreshes            = 0;
+        uint64_t total_pool_hits            = 0;  // cumulative across all sentences
+        uint64_t total_pool_misses          = 0;  // cumulative across all sentences
 
         // Sentence-local accumulators
         uint64_t sent_tokens                = 0;
@@ -118,6 +120,8 @@ struct llama_expert_pool {
         void end_sentence() {
             total_sentences++;
             total_refreshes++;
+            total_pool_hits   += sent_pool_hits;
+            total_pool_misses += sent_pool_misses;
             uint64_t total_unique = 0;
             for (const auto & s : sent_layer_experts) {
                 total_unique += s.size();

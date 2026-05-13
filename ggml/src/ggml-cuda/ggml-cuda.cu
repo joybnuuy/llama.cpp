@@ -659,14 +659,6 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     }
 
     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-        if (tensor->ne[2] == 20 || tensor->ne[2] == 256) {
-            const size_t original_size = ggml_nbytes(tensor);
-            const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
-            fprintf(stderr, "[CUDA_INIT] tensor=%s data=%p usage=%s orig=%zu padded=%zu\n",
-                tensor->name, tensor->data,
-                ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ? "WEIGHTS" : "OTHER",
-                original_size, padded_size);
-        }
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
@@ -727,10 +719,6 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
-        if (src->ne[2] == 20 || src->ne[2] == 256) {
-            fprintf(stderr, "[CUDA_CPY] sync src=%s dst=%s src_data=%p dst_data=%p nbytes=%zu dev_same=%d\n",
-                src->name, dst->name, src->data, dst->data, ggml_nbytes(src), (int)(src_ctx->device == dst_ctx->device));
-        }
         if (src_ctx->device == dst_ctx->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
@@ -2640,19 +2628,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
-    if (src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0) {
-        static int cnt = 0;
-        if (cnt++ < 12) {
-            fprintf(stderr, "[MMID] dst=%s src0=%s ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] buf=%p data=%p extra=%p flags=0x%x type=%s buft=%s\n",
-                dst->name, src0->name,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
-                (void*)src0->buffer, src0->data, src0->extra, src0->flags,
-                ggml_type_name(src0->type),
-                src0->buffer ? ggml_backend_buft_name(src0->buffer->buft) : "null");
-        }
-    }
-
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -3202,11 +3177,6 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
-
-    if (src->ne[2] == 20 || src->ne[2] == 256) {
-        fprintf(stderr, "[CUDA_CPY_ASYNC] src=%s dst=%s src_data=%p dst_data=%p nbytes=%zu\n",
-            src->name, dst->name, src->data, dst->data, ggml_nbytes(src));
-    }
 
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;

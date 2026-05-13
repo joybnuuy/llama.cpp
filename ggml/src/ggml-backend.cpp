@@ -1099,6 +1099,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_free(sched->ctx);
 
+    // Clear hash state that referenced tensors inside the freed ctx. Without this,
+    // hv_tensor_copies holds dangling pointers, and a subsequent graph with
+    // structurally-different tensors (e.g. expert-pool switching from free-pass to
+    // constrained) may inherit stale backend assignments and route CUDA pool tensors
+    // to CPU instead of keeping them on CUDA.
+    ggml_hash_set_reset(&sched->hash_set);
+    memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+
     sched->ctx = ggml_init(params);
     if (sched->ctx == NULL) {
         GGML_ABORT("%s: failed to initialize context\n", __func__);

@@ -51,11 +51,6 @@ struct llama_expert_pool {
     using ggml_backend_buffer_ptr = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>;
     ggml_backend_buffer_ptr buf{nullptr, &ggml_backend_buffer_free};
 
-    // DEBUG: mirror buffer for D2D copy verification
-    ggml_tensor * debug_mirror_up_exps = nullptr;
-    ggml_backend_buffer_ptr debug_mirror_buf{nullptr, &ggml_backend_buffer_free};
-    ggml_context_ptr debug_mirror_ctx{nullptr, &ggml_free};
-
     // Debug / stats
     struct stats {
         uint64_t total_free_pass_tokens     = 0;

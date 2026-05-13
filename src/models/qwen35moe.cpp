@@ -490,6 +490,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         if (pool_layer.down_exps)    down_exps    = pool_layer.down_exps;
         if (pool_layer.gate_up_exps && model.layers[il].ffn_gate_up_exps) gate_up_exps = pool_layer.gate_up_exps;
         n_expert_eff = expert_pool->pool_size;
+
+        if (up_exps   != model.layers[il].ffn_up_exps)   ggml_set_input(up_exps);
+        if (gate_exps != model.layers[il].ffn_gate_exps) ggml_set_input(gate_exps);
+        if (down_exps != model.layers[il].ffn_down_exps) ggml_set_input(down_exps);
+        if (gate_inp  != model.layers[il].ffn_gate_inp)  ggml_set_input(gate_inp);
+        if (gate_up_exps && gate_up_exps != model.layers[il].ffn_gate_up_exps) ggml_set_input(gate_up_exps);
     }
 
     ggml_tensor * moe_out =

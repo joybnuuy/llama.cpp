@@ -40,6 +40,15 @@ struct llama_expert_pool {
     int bootstrap_n = 3;
     int free_pass_remaining = 0;
 
+    // Backfill: max experts to copy per token in constrained mode
+    int refresh_budget = 5;
+
+    // Token counter for LRU tracking
+    uint64_t token_counter = 0;
+
+    // Per-layer per-slot last-used timestamp (for LRU eviction)
+    std::vector<std::vector<uint64_t>> slot_last_used;
+
     // Incremented when pool changes; used for graph reuse invalidation
     uint64_t pool_generation = 0;
 
@@ -180,6 +189,9 @@ struct llama_expert_pool {
 
     // Refresh pool for a layer: copy expert data from full tensor to pooled tensor
     void refresh_layer(int il, const llama_layer & layer, const std::vector<int32_t> & new_pool);
+
+    // Refresh a single slot in a layer: copy one expert into one pool slot
+    void refresh_slot(int il, const llama_layer & layer, int32_t slot, int32_t eid);
 
     // Reset expert scores (called at sentence boundary before bootstrap)
     void reset_scores();

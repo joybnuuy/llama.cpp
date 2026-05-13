@@ -370,6 +370,7 @@ extern "C" {
         bool op_offload;  // offload host tensor operations to device
         int32_t expert_cache_n_slots; // N-slot LRU expert cache: 0=off, -1=dedup-only, -2=auto (fill available VRAM), N>0=N GPU slots per layer
         int32_t moe_pool_size;        // Max experts per layer in GPU pool for sentence-level caching. 0=disabled
+        int32_t moe_pool_refresh_budget; // Max experts to copy per token during constrained backfill. 0=disable backfill
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
                           // NOTE: setting to false when n_seq_max > 1 can cause bad performance in some cases
                           //       ref: https://github.com/ggml-org/llama.cpp/pull/13845#issuecomment-2924800573

@@ -2362,6 +2362,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_pool_size = std::stoi(value);
         }
     ).set_env("LLAMA_ARG_MOE_POOL_SIZE"));
+    add_opt(common_arg(
+        {"--moe-pool-refresh-budget"}, "N",
+        "max experts to copy per token during constrained backfill (default: 5). "
+        "Higher values fill the pool faster but use more PCIe bandwidth.",
+        [](common_params & params, const std::string & value) {
+            params.moe_pool_refresh_budget = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_POOL_REFRESH_BUDGET"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

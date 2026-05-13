@@ -402,9 +402,10 @@ llama_context::llama_context(
                 LLAMA_LOG_WARN("%s: failed to initialize expert pool, disabling\n", __func__);
                 expert_pool.pool_size = 0;
             } else {
+                expert_pool.refresh_budget = params.moe_pool_refresh_budget;
                 expert_pool.stats.start_sentence(hparams.n_layer, params.moe_pool_size);
-                LLAMA_LOG_INFO("%s: expert pool enabled (pool_size=%d). Use --cpu-moe to keep full MoE weights in system RAM.\n",
-                        __func__, params.moe_pool_size);
+                LLAMA_LOG_INFO("%s: expert pool enabled (pool_size=%d, refresh_budget=%d). Use --cpu-moe to keep full MoE weights in system RAM.\n",
+                        __func__, params.moe_pool_size, expert_pool.refresh_budget);
             }
         }
     }
@@ -1878,7 +1879,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // Constrained mode: track stats and watch for sentence boundary
+        // Constrained mode: track stats, backfill missing experts, watch for sentence boundary
         if (expert_pool.is_constrained()) {
             if (expert_pool.pool_size > 0) {
                 ggml_backend_sched_synchronize(sched.get());
@@ -1887,9 +1888,53 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 expert_pool.stats.record_token(false, model.hparams.n_layer, selected_experts, expert_pool.pool);
 
+                // Update LRU timestamps for slots that were actually used
+                for (int il = 0; il < model.hparams.n_layer; ++il) {
+                    for (int32_t slot : selected_experts[il]) {
+                        if (slot >= 0 && slot < expert_pool.pool_size) {
+                            expert_pool.slot_last_used[il][slot] = expert_pool.token_counter;
+                        }
+                    }
+                }
+
                 std::vector<std::vector<int32_t>> full_topk;
                 read_back_experts_full(full_topk);
                 expert_pool.stats.record_true_hits(model.hparams.n_layer, full_topk, expert_pool.pool);
+
+                // Incremental backfill: copy missing experts into empty/cold slots
+                if (expert_pool.refresh_budget > 0) {
+                    int budget = expert_pool.refresh_budget;
+                    for (int il = 0; il < model.hparams.n_layer && budget > 0; ++il) {
+                        std::unordered_set<int32_t> pool_set;
+                        for (int32_t eid : expert_pool.pool[il]) {
+                            if (eid >= 0) pool_set.insert(eid);
+                        }
+                        for (int32_t eid : full_topk[il]) {
+                            if (eid < 0 || pool_set.count(eid)) continue;
+                            // Find best slot: empty first, then evict LRU
+                            int best_slot = -1;
+                            for (int s = 0; s < expert_pool.pool_size; ++s) {
+                                if (expert_pool.pool[il][s] < 0) {
+                                    best_slot = s;
+                                    break;
+                                }
+                                if (best_slot < 0 || expert_pool.slot_last_used[il][s] < expert_pool.slot_last_used[il][best_slot]) {
+                                    best_slot = s;
+                                }
+                            }
+                            if (best_slot >= 0) {
+                                expert_pool.refresh_slot(il, model.layers[il], best_slot, eid);
+                                expert_pool.slot_last_used[il][best_slot] = expert_pool.token_counter;
+                                pool_set.insert(eid);
+                                budget--;
+                                if (budget <= 0) break;
+                            }
+                        }
+                    }
+                    // Ensure GPU copies complete before next graph evaluation
+                    ggml_backend_sched_synchronize(sched.get());
+                }
+                expert_pool.token_counter++;
             }
 
             bool boundary = false;
@@ -1906,11 +1951,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 expert_pool.stats.start_sentence(model.hparams.n_layer, expert_pool.pool_size);
 
                 expert_pool.reset_scores();
-                expert_pool.state = llama_expert_pool::FREE_PASS;
-                expert_pool.free_pass_remaining = expert_pool.bootstrap_n;
-                expert_pool.pool_generation++;  // invalidate graph cache for free-pass rebuild
-                LLAMA_LOG_INFO("%s: sentence boundary detected, starting %d-token bootstrap\n",
-                        __func__, expert_pool.bootstrap_n);
+                // Stay in CONSTRAINED mode — incremental backfill will adapt the pool
+                // No pool_generation bump needed since graph shape doesn't change
+                LLAMA_LOG_INFO("%s: sentence boundary detected, staying CONSTRAINED with incremental backfill\n", __func__);
             }
         }
 
@@ -3420,6 +3463,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.expert_cache_n_slots         =*/ 0,
         /*.moe_pool_size               =*/ 0,
+        /*.moe_pool_refresh_budget     =*/ 5,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
@@ -4144,6 +4188,8 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
         pool[il].resize(pool_size, -1);
     }
 
+    slot_last_used.assign(n_layer, std::vector<uint64_t>(pool_size, 0));
+
     buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
     if (!buf) {
         ctx.reset();
@@ -4152,6 +4198,19 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     // Pool tensors are persistent weights, not temporary compute buffers.
     // COMPUTE usage caused garbage output because the allocator may reuse them.
     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // Initialize empty gate_inp slots to large negative values so the router
+    // never selects them before they are backfilled with real expert data.
+    for (int il = 0; il < n_layer; ++il) {
+        if (layers[il].gate_inp && layers[il].gate_inp->type == GGML_TYPE_F32) {
+            size_t n_elements = layers[il].gate_inp->ne[0];
+            size_t row_bytes  = layers[il].gate_inp->nb[1];
+            std::vector<float> neg_row(n_elements, -1000.0f);
+            for (int s = 0; s < pool_size; ++s) {
+                ggml_backend_tensor_set(layers[il].gate_inp, neg_row.data(), s * row_bytes, row_bytes);
+            }
+        }
+    }
 
     total_size = ggml_backend_buffer_get_size(buf.get());
 
@@ -4211,6 +4270,51 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
     }
 
     pool[il] = new_pool;
+}
+
+void llama_expert_pool::refresh_slot(int il, const llama_layer & layer, int32_t slot, int32_t eid) {
+    GGML_ASSERT(il >= 0 && il < n_layer);
+    GGML_ASSERT(slot >= 0 && slot < pool_size);
+    GGML_ASSERT(eid >= 0 && eid < n_expert);
+
+    auto & pl = layers[il];
+
+    // Pre-allocate staging buffer sized to the largest expert slice
+    size_t max_expert_bytes = 0;
+    auto update_max = [&](ggml_tensor * t) {
+        if (t) {
+            size_t b = t->ne[2] > 1 ? t->nb[2] : t->nb[1];
+            if (b > max_expert_bytes) max_expert_bytes = b;
+        }
+    };
+    update_max(layer.ffn_gate_inp);
+    update_max(layer.ffn_up_exps);
+    update_max(layer.ffn_gate_exps);
+    update_max(layer.ffn_down_exps);
+    update_max(layer.ffn_gate_up_exps);
+    std::vector<char> tmp(max_expert_bytes);
+
+    auto copy_one = [&](ggml_tensor * dst, ggml_tensor * src) {
+        if (!dst || !src) return;
+        GGML_ASSERT(src->ne[0] == dst->ne[0]);
+        if (src->ne[2] > 1) {
+            GGML_ASSERT(src->ne[1] == dst->ne[1]);
+        }
+        size_t src_stride = src->ne[2] > 1 ? src->nb[2] : src->nb[1];
+        size_t dst_stride = dst->ne[2] > 1 ? dst->nb[2] : dst->nb[1];
+        size_t expert_bytes = src->ne[2] > 1 ? src->nb[2] : src->nb[1];
+
+        ggml_backend_tensor_get(src, tmp.data(), eid * src_stride, expert_bytes);
+        ggml_backend_tensor_set(dst, tmp.data(), slot * dst_stride, expert_bytes);
+    };
+
+    copy_one(pl.gate_inp,     layer.ffn_gate_inp);
+    copy_one(pl.up_exps,      layer.ffn_up_exps);
+    copy_one(pl.gate_exps,    layer.ffn_gate_exps);
+    copy_one(pl.down_exps,    layer.ffn_down_exps);
+    copy_one(pl.gate_up_exps, layer.ffn_gate_up_exps);
+
+    pool[il][slot] = eid;
 }
 
 void llama_expert_pool::reset_scores() {

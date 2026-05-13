@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_set>
+#include <unordered_map>
 
 struct llama_layer;
 
@@ -188,7 +189,7 @@ struct llama_expert_pool {
     bool is_free_pass() const { return state == FREE_PASS && pool_size > 0; }
 
     // Refresh pool for a layer: copy expert data from full tensor to pooled tensor
-    void refresh_layer(int il, const llama_layer & layer, const std::vector<int32_t> & new_pool);
+    void refresh_layer(int il, const llama_layer & layer, const std::vector<int32_t> & new_pool, const std::vector<int32_t> & old_pool);
 
     // Refresh a single slot in a layer: copy one expert into one pool slot
     void refresh_slot(int il, const llama_layer & layer, int32_t slot, int32_t eid);

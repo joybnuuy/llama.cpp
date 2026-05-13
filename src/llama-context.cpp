@@ -1863,10 +1863,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
             expert_pool.free_pass_remaining--;
 
             if (expert_pool.free_pass_remaining <= 0) {
+                // Save old pools before finalize_pool overwrites them
+                std::vector<std::vector<int32_t>> old_pools = expert_pool.pool;
+
                 expert_pool.finalize_pool();
 
                 for (int il = 0; il < model.hparams.n_layer; ++il) {
-                    expert_pool.refresh_layer(il, model.layers[il], expert_pool.pool[il]);
+                    expert_pool.refresh_layer(il, model.layers[il], expert_pool.pool[il], old_pools[il]);
                 }
 
                 // Ensure all GPU copies from refresh_layer complete before next graph
@@ -1879,7 +1882,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // Constrained mode: track stats, backfill missing experts, watch for sentence boundary
+        // Constrained mode: track stats, accumulate full-router data, backfill, watch for boundary
         if (expert_pool.is_constrained()) {
             if (expert_pool.pool_size > 0) {
                 ggml_backend_sched_synchronize(sched.get());
@@ -1888,21 +1891,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 expert_pool.stats.record_token(false, model.hparams.n_layer, selected_experts, expert_pool.pool);
 
-                // Update LRU timestamps for slots that were actually used
-                for (int il = 0; il < model.hparams.n_layer; ++il) {
-                    for (int32_t slot : selected_experts[il]) {
-                        if (slot >= 0 && slot < expert_pool.pool_size) {
-                            expert_pool.slot_last_used[il][slot] = expert_pool.token_counter;
-                        }
-                    }
-                }
-
+                // Update LRU timestamps using the shadow full-router top-k.
+                // NOTE: read_back_experts() reads from ffn_moe_topk-{il} which contains
+                // stale global IDs in constrained mode (CUDA fused kernel doesn't write it).
+                // We use full_topk instead to get correct global expert IDs, then map them
+                // to pool slots for accurate LRU tracking.
                 std::vector<std::vector<int32_t>> full_topk;
                 read_back_experts_full(full_topk);
                 expert_pool.stats.record_true_hits(model.hparams.n_layer, full_topk, expert_pool.pool);
 
+                for (int il = 0; il < model.hparams.n_layer; ++il) {
+                    for (int32_t eid : full_topk[il]) {
+                        if (eid < 0) continue;
+                        // Map global expert ID to its pool slot
+                        for (int s = 0; s < expert_pool.pool_size; ++s) {
+                            if (expert_pool.pool[il][s] == eid) {
+                                expert_pool.slot_last_used[il][s] = expert_pool.token_counter;
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 // Incremental backfill: copy missing experts into empty/cold slots
                 if (expert_pool.refresh_budget > 0) {
+
                     int budget = expert_pool.refresh_budget;
                     for (int il = 0; il < model.hparams.n_layer && budget > 0; ++il) {
                         std::unordered_set<int32_t> pool_set;
@@ -1948,12 +1961,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
             if (boundary) {
                 expert_pool.stats.end_sentence();
+                uint64_t total = expert_pool.stats.total_free_pass_tokens + expert_pool.stats.total_constrained_tokens;
+                if (total > 0) {
+                    uint64_t true_selections = expert_pool.stats.total_true_hits + expert_pool.stats.total_true_misses;
+                    double true_hit_rate = true_selections > 0 ? 100.0 * expert_pool.stats.total_true_hits / true_selections : 0.0;
+                    LLAMA_LOG_INFO("%s: expert-pool: sentences=%" PRIu64 " free=%" PRIu64 " constrained=%" PRIu64 " (%.1f%% free) true_hit_rate=%.1f%%\n",
+                        __func__, expert_pool.stats.total_sentences,
+                        expert_pool.stats.total_free_pass_tokens,
+                        expert_pool.stats.total_constrained_tokens,
+                        100.0 * expert_pool.stats.total_free_pass_tokens / total,
+                        true_hit_rate);
+                }
                 expert_pool.stats.start_sentence(model.hparams.n_layer, expert_pool.pool_size);
 
                 expert_pool.reset_scores();
-                // Stay in CONSTRAINED mode — incremental backfill will adapt the pool
-                // No pool_generation bump needed since graph shape doesn't change
-                LLAMA_LOG_INFO("%s: sentence boundary detected, staying CONSTRAINED with incremental backfill\n", __func__);
+                expert_pool.state = llama_expert_pool::FREE_PASS;
+                expert_pool.free_pass_remaining = expert_pool.bootstrap_n;
+                expert_pool.pool_generation++;  // invalidate graph cache for free-pass rebuild
+                LLAMA_LOG_INFO("%s: sentence boundary detected, starting %d-token bootstrap\n",
+                        __func__, expert_pool.bootstrap_n);
             }
         }
 
@@ -4223,13 +4249,42 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     return true;
 }
 
-void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const std::vector<int32_t> & new_pool) {
+void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const std::vector<int32_t> & new_pool, const std::vector<int32_t> & old_pool) {
     GGML_ASSERT(il >= 0 && il < n_layer);
     GGML_ASSERT((int)new_pool.size() <= pool_size);
 
     auto & pl = layers[il];
 
-    // Pre-allocate a single staging buffer sized to the largest expert slice
+    // Build a set of (old_eid -> slot) for the previous pool to find unchanged entries
+    std::unordered_map<int32_t, int32_t> old_eid_to_slot;
+    for (int s = 0; s < pool_size && s < (int)old_pool.size(); ++s) {
+        int32_t old_eid = old_pool[s];
+        if (old_eid >= 0) {
+            old_eid_to_slot[old_eid] = s;
+        }
+    }
+
+    // Assign new_pool experts to slots, reusing slots where the same expert is already present
+    // This minimizes PCIe transfers by only copying experts that actually changed
+    std::vector<int32_t> slot_assignment(pool_size, -1);  // slot_assignment[new_slot] = old_slot or -1
+    std::vector<bool> old_slot_used(pool[il].size(), false);
+    int copies_saved = 0;
+    int copies_needed = 0;
+
+    // First pass: assign experts that are already in the pool to their existing slot
+    for (int s = 0; s < (int)new_pool.size() && s < pool_size; ++s) {
+        int32_t eid = new_pool[s];
+        if (eid < 0) continue;
+        auto it = old_eid_to_slot.find(eid);
+        if (it != old_eid_to_slot.end() && !old_slot_used[it->second]) {
+            // This expert is already in the pool at this slot — can be reused in place
+            // But we may need to move it to a different slot in the new layout
+            slot_assignment[s] = it->second;
+            old_slot_used[it->second] = true;
+        }
+    }
+
+    // Pre-allocate staging buffer
     size_t max_expert_bytes = 0;
     auto update_max = [&](ggml_tensor * t) {
         if (t) {
@@ -4258,16 +4313,54 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
         ggml_backend_tensor_set(dst, tmp.data(), dst_slot * dst_stride, expert_bytes);
     };
 
-    for (size_t slot = 0; slot < new_pool.size(); ++slot) {
-        int32_t eid = new_pool[slot];
+    // Second pass: for experts that need to be copied, either move within pool or copy from model
+    // We need to handle the case where an expert needs to move from one slot to another
+    // Do moves in two phases: first identify all moves, then execute in safe order
+
+    // Collect all operations needed
+    struct PendingOp {
+        int32_t eid;        // global expert ID
+        int32_t dst_slot;   // slot in pool to write to
+        int32_t src_slot;   // old slot if moving within pool, or -1 if copying from model
+    };
+    std::vector<PendingOp> ops;
+
+    for (int s = 0; s < (int)new_pool.size() && s < pool_size; ++s) {
+        int32_t eid = new_pool[s];
         if (eid < 0 || eid >= n_expert) continue;
 
-        copy_expert(pl.gate_inp,     layer.ffn_gate_inp,     eid, slot);
-        copy_expert(pl.up_exps,      layer.ffn_up_exps,      eid, slot);
-        copy_expert(pl.gate_exps,    layer.ffn_gate_exps,    eid, slot);
-        copy_expert(pl.down_exps,    layer.ffn_down_exps,    eid, slot);
-        copy_expert(pl.gate_up_exps, layer.ffn_gate_up_exps, eid, slot);
+        if (slot_assignment[s] >= 0) {
+            // Expert already in pool — check if it's in the right slot
+            if (slot_assignment[s] == s) {
+                // Expert is already in the correct slot, no copy needed
+                copies_saved++;
+            } else {
+                // Expert is in the pool but in a different slot — need to move it
+                ops.push_back({eid, s, slot_assignment[s]});
+                copies_needed++;
+            }
+        } else {
+            // Expert not in pool — need to copy from model
+            ops.push_back({eid, s, -1});
+            copies_needed++;
+        }
     }
+
+    // Execute moves/copies. For within-pool moves where src might be overwritten,
+    // we use the model as source (since slot_assignment[s] >= 0 means eid was in old pool,
+    // but we can always get the data from the model tensors).
+    // Actually, for simplicity and correctness, always copy from model tensors.
+    // Within-pool moves could be optimized later with a tmp buffer.
+    for (const auto & op : ops) {
+        copy_expert(pl.gate_inp,     layer.ffn_gate_inp,     op.eid, op.dst_slot);
+        copy_expert(pl.up_exps,      layer.ffn_up_exps,      op.eid, op.dst_slot);
+        copy_expert(pl.gate_exps,    layer.ffn_gate_exps,    op.eid, op.dst_slot);
+        copy_expert(pl.down_exps,    layer.ffn_down_exps,    op.eid, op.dst_slot);
+        copy_expert(pl.gate_up_exps, layer.ffn_gate_up_exps, op.eid, op.dst_slot);
+    }
+
+    LLAMA_LOG_INFO("%s: layer %d pool refresh: %d experts unchanged, %d experts copied\n",
+            __func__, il, copies_saved, copies_needed);
 
     pool[il] = new_pool;
 }

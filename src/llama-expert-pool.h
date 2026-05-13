@@ -37,7 +37,7 @@ struct llama_expert_pool {
     enum state { FREE_PASS, CONSTRAINED } state = FREE_PASS;
 
     // Number of bootstrap (free-pass) tokens at sentence start
-    int bootstrap_n = 6;
+    int bootstrap_n = 3;
     int free_pass_remaining = 0;
 
     // Incremented when pool changes; used for graph reuse invalidation

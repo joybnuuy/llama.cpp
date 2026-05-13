@@ -60,6 +60,10 @@ struct llama_expert_pool {
         uint64_t total_pool_hits            = 0;  // cumulative across all sentences
         uint64_t total_pool_misses          = 0;  // cumulative across all sentences
 
+        // TRUE hit rate: full-router top-k selections that are already in pool
+        uint64_t total_true_hits            = 0;
+        uint64_t total_true_misses          = 0;
+
         // Sentence-local accumulators
         uint64_t sent_tokens                = 0;
         uint64_t sent_free_pass_tokens      = 0;
@@ -67,6 +71,8 @@ struct llama_expert_pool {
         uint64_t sent_unique_experts        = 0;  // union across all layers
         uint64_t sent_pool_hits             = 0;  // constrained selections that map to a filled pool slot
         uint64_t sent_pool_misses           = 0;  // constrained selections mapping to -1 (should never happen)
+        uint64_t sent_true_hits             = 0;  // full-router selections present in pool
+        uint64_t sent_true_misses           = 0;  // full-router selections NOT present in pool
 
         std::vector<std::unordered_set<int32_t>> sent_layer_experts; // per-layer unique experts
         std::vector<std::vector<uint64_t>>       sent_slot_hits;     // per-layer per-slot hit count
@@ -78,6 +84,8 @@ struct llama_expert_pool {
             sent_unique_experts     = 0;
             sent_pool_hits          = 0;
             sent_pool_misses        = 0;
+            sent_true_hits          = 0;
+            sent_true_misses        = 0;
             sent_layer_experts.assign(n_layer, {});
             sent_slot_hits.assign(n_layer, std::vector<uint64_t>(pool_size, 0));
         }
@@ -117,11 +125,35 @@ struct llama_expert_pool {
             }
         }
 
+        void record_true_hits(int n_layer,
+                              const std::vector<std::vector<int32_t>> & full_topk,
+                              const std::vector<std::vector<int32_t>> & pool_mapping) {
+            // Build a per-layer set of experts currently in the pool for fast lookup
+            for (int il = 0; il < n_layer && il < (int)full_topk.size(); ++il) {
+                std::unordered_set<int32_t> pool_set;
+                if (il < (int)pool_mapping.size()) {
+                    for (int32_t eid : pool_mapping[il]) {
+                        if (eid >= 0) pool_set.insert(eid);
+                    }
+                }
+                for (int32_t eid : full_topk[il]) {
+                    if (eid < 0) continue;
+                    if (pool_set.count(eid)) {
+                        sent_true_hits++;
+                    } else {
+                        sent_true_misses++;
+                    }
+                }
+            }
+        }
+
         void end_sentence() {
             total_sentences++;
             total_refreshes++;
             total_pool_hits   += sent_pool_hits;
             total_pool_misses += sent_pool_misses;
+            total_true_hits   += sent_true_hits;
+            total_true_misses += sent_true_misses;
             uint64_t total_unique = 0;
             for (const auto & s : sent_layer_experts) {
                 total_unique += s.size();

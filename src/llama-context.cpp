@@ -425,12 +425,14 @@ llama_context::~llama_context() {
         if (total > 0) {
             uint64_t selections = expert_pool.stats.total_pool_hits + expert_pool.stats.total_pool_misses;
             double hit_rate = selections > 0 ? 100.0 * expert_pool.stats.total_pool_hits / selections : 0.0;
-            LLAMA_LOG_INFO("%s: expert-pool: sentences=%" PRIu64 " free=%" PRIu64 " constrained=%" PRIu64 " (%.1f%% free) hit_rate=%.1f%%\n",
+            uint64_t true_selections = expert_pool.stats.total_true_hits + expert_pool.stats.total_true_misses;
+            double true_hit_rate = true_selections > 0 ? 100.0 * expert_pool.stats.total_true_hits / true_selections : 0.0;
+            LLAMA_LOG_INFO("%s: expert-pool: sentences=%" PRIu64 " free=%" PRIu64 " constrained=%" PRIu64 " (%.1f%% free) hit_rate=%.1f%% true_hit_rate=%.1f%%\n",
                 __func__, expert_pool.stats.total_sentences,
                 expert_pool.stats.total_free_pass_tokens,
                 expert_pool.stats.total_constrained_tokens,
                 100.0 * expert_pool.stats.total_free_pass_tokens / total,
-                hit_rate);
+                hit_rate, true_hit_rate);
         }
     }
     if (!model.hparams.no_alloc) {
@@ -1824,6 +1826,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         };
 
+        // Helper to read back shadow full-router top-k selections
+        auto read_back_experts_full = [&](std::vector<std::vector<int32_t>> & out) {
+            out.resize(model.hparams.n_layer);
+            for (int il = 0; il < model.hparams.n_layer; ++il) {
+                char name[32];
+                snprintf(name, sizeof(name), "ffn_moe_topk_full-%d", il);
+                ggml_tensor * node = nullptr;
+                for (int i = 0; i < ggml_graph_n_nodes(res->get_gf()); ++i) {
+                    ggml_tensor * cur_node = ggml_graph_node(res->get_gf(), i);
+                    if (cur_node && strcmp(cur_node->name, name) == 0) {
+                        node = cur_node;
+                        break;
+                    }
+                }
+                if (node) {
+                    int32_t ids[8];
+                    size_t read_bytes = std::min((size_t)(8 * sizeof(int32_t)), ggml_nbytes(node));
+                    ggml_backend_tensor_get(node, ids, 0, read_bytes);
+                    int n_ids = (int)(read_bytes / sizeof(int32_t));
+                    out[il].assign(ids, ids + n_ids);
+                }
+            }
+        };
+
         // MoE expert pool: accumulate bootstrap tokens, then refresh
         if (expert_pool.is_free_pass()) {
             ggml_backend_sched_synchronize(sched.get());
@@ -1860,6 +1886,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 read_back_experts(selected_experts);
 
                 expert_pool.stats.record_token(false, model.hparams.n_layer, selected_experts, expert_pool.pool);
+
+                std::vector<std::vector<int32_t>> full_topk;
+                read_back_experts_full(full_topk);
+                expert_pool.stats.record_true_hits(model.hparams.n_layer, full_topk, expert_pool.pool);
             }
 
             bool boundary = false;

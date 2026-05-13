@@ -145,6 +145,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             if (pool_layer.gate_exps) gate_exps = pool_layer.gate_exps;
             if (pool_layer.down_exps) down_exps = pool_layer.down_exps;
             n_expert_eff = expert_pool->pool_size;
+
+            // Shadow full-router audit: compute top-k using ALL experts
+            ggml_tensor * full_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+            ggml_tensor * full_probs  = ggml_soft_max(ctx0, full_logits);
+            ggml_tensor * full_topk  = ggml_argsort_top_k(ctx0, full_probs, n_expert_used);
+            cb(full_topk, "ffn_moe_topk_full", il);
+            ggml_build_forward_expand(gf, full_topk);
         }
 
         ggml_tensor * moe_out =

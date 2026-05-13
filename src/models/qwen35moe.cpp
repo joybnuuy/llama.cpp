@@ -496,6 +496,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         if (down_exps != model.layers[il].ffn_down_exps) ggml_set_input(down_exps);
         if (gate_inp  != model.layers[il].ffn_gate_inp)  ggml_set_input(gate_inp);
         if (gate_up_exps && gate_up_exps != model.layers[il].ffn_gate_up_exps) ggml_set_input(gate_up_exps);
+
+        // Shadow full-router audit: compute top-k using ALL experts so we can measure
+        // true hit rate (overlap between full-router selections and current pool).
+        // This path is SOFT_MAX -> ARGSORT with no RESHAPE/VIEW/GET_ROWS,
+        // so it does NOT match the CUDA topk_moe fusion pattern -> tensor is readable.
+        ggml_tensor * full_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+        ggml_tensor * full_probs  = ggml_soft_max(ctx0, full_logits);
+        ggml_tensor * full_topk  = ggml_argsort_top_k(ctx0, full_probs, n_expert_used);
+        cb(full_topk, "ffn_moe_topk_full", il);
+        ggml_build_forward_expand(gf, full_topk);
     }
 
     ggml_tensor * moe_out =

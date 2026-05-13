@@ -1515,6 +1515,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_cache_n_slots = params.expert_cache_n_slots;
     cparams.moe_pool_size        = params.moe_pool_size;
     cparams.moe_pool_refresh_budget = params.moe_pool_refresh_budget;
+    cparams.moe_pool_full_layers  = params.moe_pool_full_layers;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 

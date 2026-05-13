@@ -21,7 +21,9 @@ struct llama_expert_pool {
         ggml_tensor * gate_up_exps = nullptr;  // fused gate+up [n_embd*2, n_ff_exp, pool_size]
     };
 
-    int pool_size  = 0;
+    int pool_size  = 0;  // default pool size for pooled layers
+    std::vector<int> pool_sizes;      // per-layer: pool_sizes[il] = pool size (n_expert for full layers)
+    int n_full_layers = 0;            // number of layers with all experts loaded
     int n_expert   = 0;
     int n_layer    = 0;
     int n_embd     = 0;
@@ -184,9 +186,12 @@ struct llama_expert_pool {
     bool init(int pool_size, int n_expert, int n_layer, int n_embd, int n_ff_exp,
               ggml_backend_buffer_type_t buft,
               const std::vector<layer_types> & types_per_layer,
-              bool has_gate_up_exps);
+              bool has_gate_up_exps,
+              int n_full_layers = 0);
     bool is_constrained() const { return state == CONSTRAINED && pool_size > 0; }
-    bool is_free_pass() const { return state == FREE_PASS && pool_size > 0; }
+    bool is_free_pass()    const { return state == FREE_PASS && pool_size > 0; }
+    bool is_full_layer(int il) const { return il < (int)pool_sizes.size() && pool_sizes[il] >= n_expert; }
+    int  get_pool_size(int il) const { return il < (int)pool_sizes.size() ? pool_sizes[il] : pool_size; }
 
     // Refresh pool for a layer: copy expert data from full tensor to pooled tensor
     void refresh_layer(int il, const llama_layer & layer, const std::vector<int32_t> & new_pool, const std::vector<int32_t> & old_pool);
@@ -208,4 +213,5 @@ struct llama_expert_pool {
 
     // Get effective n_expert for graph building
     int get_n_expert() const { return is_constrained() ? pool_size : n_expert; }
+    int get_n_expert(int il) const { return is_constrained() ? get_pool_size(il) : n_expert; }
 };

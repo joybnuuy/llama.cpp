@@ -398,14 +398,21 @@ llama_context::llama_context(
                 types_per_layer[il].gate_up_exps = lay.ffn_gate_up_exps ? lay.ffn_gate_up_exps->type : GGML_TYPE_F32;
             }
             if (!expert_pool.init(params.moe_pool_size, hparams.n_expert, hparams.n_layer, hparams.n_embd, n_ff_exp,
-                                  buft, types_per_layer, has_gate_up_exps)) {
+                                  buft, types_per_layer, has_gate_up_exps, params.moe_pool_full_layers)) {
                 LLAMA_LOG_WARN("%s: failed to initialize expert pool, disabling\n", __func__);
                 expert_pool.pool_size = 0;
             } else {
                 expert_pool.refresh_budget = params.moe_pool_refresh_budget;
                 expert_pool.stats.start_sentence(hparams.n_layer, params.moe_pool_size);
-                LLAMA_LOG_INFO("%s: expert pool enabled (pool_size=%d, refresh_budget=%d). Use --cpu-moe to keep full MoE weights in system RAM.\n",
-                        __func__, params.moe_pool_size, expert_pool.refresh_budget);
+                LLAMA_LOG_INFO("%s: expert pool enabled (pool_size=%d, full_layers=%d, refresh_budget=%d). Use --cpu-moe to keep full MoE weights in system RAM.\n",
+                        __func__, params.moe_pool_size, params.moe_pool_full_layers, expert_pool.refresh_budget);
+
+                // Full layers will be populated during the first bootstrap transition
+                // (FREE_PASS -> CONSTRAINED), same as pooled layers. The pool[il] identity
+                // mapping has already been set up in init(). No pre-loading needed here
+                // because model tensors may not be on GPU yet at this point.
+                LLAMA_LOG_INFO("%s: %d full layers configured (will be populated during first bootstrap)\n",
+                        __func__, params.moe_pool_full_layers);
             }
         }
     }
@@ -1869,6 +1876,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 expert_pool.finalize_pool();
 
                 for (int il = 0; il < model.hparams.n_layer; ++il) {
+                    if (expert_pool.is_full_layer(il)) continue;  // full layers already have all experts
                     expert_pool.refresh_layer(il, model.layers[il], expert_pool.pool[il], old_pools[il]);
                 }
 
@@ -1901,10 +1909,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 expert_pool.stats.record_true_hits(model.hparams.n_layer, full_topk, expert_pool.pool);
 
                 for (int il = 0; il < model.hparams.n_layer; ++il) {
+                    if (expert_pool.is_full_layer(il)) continue;  // no LRU needed for full layers
                     for (int32_t eid : full_topk[il]) {
                         if (eid < 0) continue;
                         // Map global expert ID to its pool slot
-                        for (int s = 0; s < expert_pool.pool_size; ++s) {
+                        const int ps = expert_pool.pool_sizes[il];
+                        for (int s = 0; s < ps; ++s) {
                             if (expert_pool.pool[il][s] == eid) {
                                 expert_pool.slot_last_used[il][s] = expert_pool.token_counter;
                                 break;
@@ -1918,6 +1928,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                     int budget = expert_pool.refresh_budget;
                     for (int il = 0; il < model.hparams.n_layer && budget > 0; ++il) {
+                        if (expert_pool.is_full_layer(il)) continue;  // no backfill for full layers
+                        const int ps = expert_pool.pool_sizes[il];
                         std::unordered_set<int32_t> pool_set;
                         for (int32_t eid : expert_pool.pool[il]) {
                             if (eid >= 0) pool_set.insert(eid);
@@ -1926,7 +1938,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             if (eid < 0 || pool_set.count(eid)) continue;
                             // Find best slot: empty first, then evict LRU
                             int best_slot = -1;
-                            for (int s = 0; s < expert_pool.pool_size; ++s) {
+                            for (int s = 0; s < ps; ++s) {
                                 if (expert_pool.pool[il][s] < 0) {
                                     best_slot = s;
                                     break;
@@ -3490,6 +3502,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_cache_n_slots         =*/ 0,
         /*.moe_pool_size               =*/ 0,
         /*.moe_pool_refresh_budget     =*/ 5,
+        /*.moe_pool_full_layers        =*/ 0,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
@@ -4129,16 +4142,29 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_embd_, int n_ff_exp_,
                                ggml_backend_buffer_type_t buft,
                                const std::vector<layer_types> & types_per_layer,
-                               bool has_gate_up_exps) {
+                               bool has_gate_up_exps,
+                               int n_full_layers_) {
     if (pool_size_ <= 0 || n_expert_ <= 0 || n_layer_ <= 0 || n_embd_ <= 0 || n_ff_exp_ <= 0) {
         return false;
     }
+    if (n_full_layers_ < 0 || n_full_layers_ > n_layer_) {
+        LLAMA_LOG_ERROR("%s: n_full_layers=%d out of range [0, %d]\n", __func__, n_full_layers_, n_layer_);
+        return false;
+    }
 
-    pool_size = pool_size_;
-    n_expert  = n_expert_;
-    n_layer   = n_layer_;
-    n_embd    = n_embd_;
-    n_ff_exp  = n_ff_exp_;
+    pool_size       = pool_size_;
+    n_expert         = n_expert_;
+    n_layer          = n_layer_;
+    n_embd           = n_embd_;
+    n_ff_exp         = n_ff_exp_;
+    n_full_layers    = n_full_layers_;
+
+    // Per-layer pool sizes: full layers get all experts, pooled layers get pool_size
+    pool_sizes.resize(n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        pool_sizes[il] = (il < n_full_layers) ? n_expert : pool_size;
+        GGML_ASSERT(pool_sizes[il] > 0 && pool_sizes[il] <= n_expert);
+    }
 
     const int n_tensors_per_layer = has_gate_up_exps ? 5 : 4;
 
@@ -4155,32 +4181,34 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     }
 
     for (int il = 0; il < n_layer; ++il) {
+        const int ps = pool_sizes[il];
         const auto & t = types_per_layer[il];
-        auto * t_gate_inp = ggml_new_tensor_2d(tmp_ctx, t.gate_inp, n_embd, pool_size);
+        auto * t_gate_inp = ggml_new_tensor_2d(tmp_ctx, t.gate_inp, n_embd, ps);
         size_t sz_gate_inp = GGML_PAD(ggml_nbytes(t_gate_inp), GGML_MEM_ALIGN);
         total_size += sz_gate_inp;
 
-        auto * t_up_exps = ggml_new_tensor_3d(tmp_ctx, t.up_exps, n_embd, n_ff_exp, pool_size);
+        auto * t_up_exps = ggml_new_tensor_3d(tmp_ctx, t.up_exps, n_embd, n_ff_exp, ps);
         size_t sz_up_exps = GGML_PAD(ggml_nbytes(t_up_exps), GGML_MEM_ALIGN);
         total_size += sz_up_exps;
 
-        auto * t_gate_exps = ggml_new_tensor_3d(tmp_ctx, t.gate_exps, n_embd, n_ff_exp, pool_size);
+        auto * t_gate_exps = ggml_new_tensor_3d(tmp_ctx, t.gate_exps, n_embd, n_ff_exp, ps);
         size_t sz_gate_exps = GGML_PAD(ggml_nbytes(t_gate_exps), GGML_MEM_ALIGN);
         total_size += sz_gate_exps;
 
-        auto * t_down_exps = ggml_new_tensor_3d(tmp_ctx, t.down_exps, n_ff_exp, n_embd, pool_size);
+        auto * t_down_exps = ggml_new_tensor_3d(tmp_ctx, t.down_exps, n_ff_exp, n_embd, ps);
         size_t sz_down_exps = GGML_PAD(ggml_nbytes(t_down_exps), GGML_MEM_ALIGN);
         total_size += sz_down_exps;
 
         if (has_gate_up_exps) {
-            auto * t_gate_up_exps = ggml_new_tensor_3d(tmp_ctx, t.gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
+            auto * t_gate_up_exps = ggml_new_tensor_3d(tmp_ctx, t.gate_up_exps, n_embd * 2, n_ff_exp, ps);
             size_t sz_gate_up = GGML_PAD(ggml_nbytes(t_gate_up_exps), GGML_MEM_ALIGN);
             total_size += sz_gate_up;
         }
 
-        if (il == 0) {
-            LLAMA_LOG_INFO("%s: per-layer sizes: gate_inp=%.2f MB, up_exps=%.2f MB, gate_exps=%.2f MB, down_exps=%.2f MB\n",
-                __func__, sz_gate_inp/1048576.0, sz_up_exps/1048576.0, sz_gate_exps/1048576.0, sz_down_exps/1048576.0);
+        if (il == 0 || (il > 0 && pool_sizes[il] != pool_sizes[il-1])) {
+            LLAMA_LOG_INFO("%s: layer %d: %s pool_size=%d, per-layer sizes: gate_inp=%.2f MB, up_exps=%.2f MB, gate_exps=%.2f MB, down_exps=%.2f MB\n",
+                __func__, il, is_full_layer(il) ? "FULL" : "POOLED", ps,
+                sz_gate_inp/1048576.0, sz_up_exps/1048576.0, sz_gate_exps/1048576.0, sz_down_exps/1048576.0);
         }
     }
 
@@ -4201,20 +4229,34 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     expert_scores.resize(n_layer, std::vector<float>(n_expert, 0.0f));
 
     for (int il = 0; il < n_layer; ++il) {
+        const int ps = pool_sizes[il];
         const auto & t = types_per_layer[il];
-        layers[il].gate_inp = ggml_new_tensor_2d(ctx.get(), t.gate_inp, n_embd, pool_size);
-        layers[il].up_exps = ggml_new_tensor_3d(ctx.get(), t.up_exps, n_embd, n_ff_exp, pool_size);
-        layers[il].gate_exps = ggml_new_tensor_3d(ctx.get(), t.gate_exps, n_embd, n_ff_exp, pool_size);
-        layers[il].down_exps = ggml_new_tensor_3d(ctx.get(), t.down_exps, n_ff_exp, n_embd, pool_size);
+        layers[il].gate_inp = ggml_new_tensor_2d(ctx.get(), t.gate_inp, n_embd, ps);
+        layers[il].up_exps = ggml_new_tensor_3d(ctx.get(), t.up_exps, n_embd, n_ff_exp, ps);
+        layers[il].gate_exps = ggml_new_tensor_3d(ctx.get(), t.gate_exps, n_embd, n_ff_exp, ps);
+        layers[il].down_exps = ggml_new_tensor_3d(ctx.get(), t.down_exps, n_ff_exp, n_embd, ps);
         if (has_gate_up_exps) {
-            layers[il].gate_up_exps = ggml_new_tensor_3d(ctx.get(), t.gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
+            layers[il].gate_up_exps = ggml_new_tensor_3d(ctx.get(), t.gate_up_exps, n_embd * 2, n_ff_exp, ps);
         } else {
             layers[il].gate_up_exps = nullptr;
         }
-        pool[il].resize(pool_size, -1);
+
+        if (is_full_layer(il)) {
+            // Full layers: identity mapping — slot i = expert i
+            pool[il].resize(ps);
+            for (int i = 0; i < ps; ++i) {
+                pool[il][i] = i;
+            }
+        } else {
+            // Pooled layers: start empty, filled during bootstrap
+            pool[il].resize(ps, -1);
+        }
     }
 
-    slot_last_used.assign(n_layer, std::vector<uint64_t>(pool_size, 0));
+    // Per-layer LRU timestamps, sized per pool_sizes[il]
+    for (int il = 0; il < n_layer; ++il) {
+        slot_last_used.emplace_back(pool_sizes[il], 0);
+    }
 
     buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
     if (!buf) {
@@ -4225,39 +4267,53 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     // COMPUTE usage caused garbage output because the allocator may reuse them.
     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // Initialize empty gate_inp slots to large negative values so the router
-    // never selects them before they are backfilled with real expert data.
+    // Initialize gate_inp for UNFILLED pool slots to large negative values
+    // so the router never selects them before they are backfilled.
+    // FULL layers: copy all expert data from model tensors instead.
     for (int il = 0; il < n_layer; ++il) {
         if (layers[il].gate_inp && layers[il].gate_inp->type == GGML_TYPE_F32) {
-            size_t n_elements = layers[il].gate_inp->ne[0];
-            size_t row_bytes  = layers[il].gate_inp->nb[1];
-            std::vector<float> neg_row(n_elements, -1000.0f);
-            for (int s = 0; s < pool_size; ++s) {
-                ggml_backend_tensor_set(layers[il].gate_inp, neg_row.data(), s * row_bytes, row_bytes);
+            if (is_full_layer(il)) {
+                // Full layer: gate_inp is already the correct size, will be copied
+                // from model weights during the initial refresh below.
+                LLAMA_LOG_INFO("%s: layer %d: FULL layer, all %d experts will be copied\n",
+                        __func__, il, pool_sizes[il]);
+            } else {
+                // Pooled layer: initialize all gate_inp rows to -1000
+                size_t n_elements = layers[il].gate_inp->ne[0];
+                size_t row_bytes  = layers[il].gate_inp->nb[1];
+                std::vector<float> neg_row(n_elements, -1000.0f);
+                for (int s = 0; s < pool_sizes[il]; ++s) {
+                    ggml_backend_tensor_set(layers[il].gate_inp, neg_row.data(), s * row_bytes, row_bytes);
+                }
             }
         }
     }
 
-    total_size = ggml_backend_buffer_get_size(buf.get());
-
     state = FREE_PASS;
     pool_generation = 1;
 
-    LLAMA_LOG_INFO("%s: expert pool initialized: %d layers, pool_size=%d, n_expert=%d, n_embd=%d, n_ff_exp=%d, has_gate_up=%d, buffer=%.2f MiB\n",
-            __func__, n_layer, pool_size, n_expert, n_embd, n_ff_exp, (int)has_gate_up_exps, total_size / 1024.0 / 1024.0);
+    size_t buf_size = ggml_backend_buffer_get_size(buf.get());
+
+    LLAMA_LOG_INFO("%s: expert pool initialized: %d layers (%d full, %d pooled), pool_size=%d, n_expert=%d, buffer=%.2f MiB\n",
+            __func__, n_layer, n_full_layers, n_layer - n_full_layers, pool_size, n_expert, buf_size / 1024.0 / 1024.0);
 
     return true;
 }
 
 void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const std::vector<int32_t> & new_pool, const std::vector<int32_t> & old_pool) {
     GGML_ASSERT(il >= 0 && il < n_layer);
-    GGML_ASSERT((int)new_pool.size() <= pool_size);
+    GGML_ASSERT((int)new_pool.size() <= pool_sizes[il]);
+    // Verify pool tensors are allocated before we try to copy into them
+    GGML_ASSERT(layers[il].gate_inp != nullptr && layers[il].gate_inp->data != nullptr);
+    GGML_ASSERT(layers[il].up_exps != nullptr && layers[il].up_exps->data != nullptr);
+    GGML_ASSERT(layers[il].down_exps != nullptr && layers[il].down_exps->data != nullptr);
 
     auto & pl = layers[il];
 
     // Build a set of (old_eid -> slot) for the previous pool to find unchanged entries
     std::unordered_map<int32_t, int32_t> old_eid_to_slot;
-    for (int s = 0; s < pool_size && s < (int)old_pool.size(); ++s) {
+    const int ps = pool_sizes[il];
+    for (int s = 0; s < ps && s < (int)old_pool.size(); ++s) {
         int32_t old_eid = old_pool[s];
         if (old_eid >= 0) {
             old_eid_to_slot[old_eid] = s;
@@ -4266,13 +4322,13 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
 
     // Assign new_pool experts to slots, reusing slots where the same expert is already present
     // This minimizes PCIe transfers by only copying experts that actually changed
-    std::vector<int32_t> slot_assignment(pool_size, -1);  // slot_assignment[new_slot] = old_slot or -1
+    std::vector<int32_t> slot_assignment(ps, -1);  // slot_assignment[new_slot] = old_slot or -1
     std::vector<bool> old_slot_used(pool[il].size(), false);
     int copies_saved = 0;
     int copies_needed = 0;
 
     // First pass: assign experts that are already in the pool to their existing slot
-    for (int s = 0; s < (int)new_pool.size() && s < pool_size; ++s) {
+    for (int s = 0; s < (int)new_pool.size() && s < ps; ++s) {
         int32_t eid = new_pool[s];
         if (eid < 0) continue;
         auto it = old_eid_to_slot.find(eid);
@@ -4301,7 +4357,10 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
 
     auto copy_expert = [&](ggml_tensor * dst, ggml_tensor * src, int32_t src_id, int32_t dst_slot) {
         if (!dst || !src) return;
-        GGML_ASSERT(src->ne[0] == dst->ne[0]);
+        GGML_ASSERT(src->data != nullptr && "src tensor not allocated");
+        GGML_ASSERT(dst->data != nullptr && "dst tensor not allocated");
+        GGML_ASSERT(src_id >= 0 && src_id < n_expert && "src expert ID out of range");
+        GGML_ASSERT(dst_slot >= 0 && dst_slot < pool_sizes[il] && "dst slot out of range");
         if (src->ne[2] > 1) {
             GGML_ASSERT(src->ne[1] == dst->ne[1]);
         }
@@ -4325,7 +4384,7 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
     };
     std::vector<PendingOp> ops;
 
-    for (int s = 0; s < (int)new_pool.size() && s < pool_size; ++s) {
+    for (int s = 0; s < (int)new_pool.size() && s < ps; ++s) {
         int32_t eid = new_pool[s];
         if (eid < 0 || eid >= n_expert) continue;
 
@@ -4367,7 +4426,7 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
 
 void llama_expert_pool::refresh_slot(int il, const llama_layer & layer, int32_t slot, int32_t eid) {
     GGML_ASSERT(il >= 0 && il < n_layer);
-    GGML_ASSERT(slot >= 0 && slot < pool_size);
+    GGML_ASSERT(slot >= 0 && slot < pool_sizes[il]);
     GGML_ASSERT(eid >= 0 && eid < n_expert);
 
     auto & pl = layers[il];
@@ -4430,21 +4489,23 @@ void llama_expert_pool::accumulate_experts(const std::vector<std::vector<int32_t
 
 void llama_expert_pool::finalize_pool() {
     for (int il = 0; il < n_layer; ++il) {
+        if (is_full_layer(il)) continue;  // full layers keep identity mapping
+        const int ps = pool_sizes[il];
         std::vector<std::pair<float, int32_t>> scored;
         scored.reserve(n_expert);
         for (int e = 0; e < n_expert; ++e) {
             scored.push_back({expert_scores[il][e], e});
         }
-        std::partial_sort(scored.begin(), scored.begin() + std::min(pool_size, n_expert), scored.end(),
+        std::partial_sort(scored.begin(), scored.begin() + std::min(ps, n_expert), scored.end(),
             [](const auto & a, const auto & b) { return a.first > b.first; });
 
         std::vector<int32_t> new_pool;
-        new_pool.reserve(pool_size);
-        for (int i = 0; i < std::min(pool_size, n_expert); ++i) {
+        new_pool.reserve(ps);
+        for (int i = 0; i < std::min(ps, n_expert); ++i) {
             new_pool.push_back(scored[i].second);
         }
 
-        while ((int)new_pool.size() < pool_size) {
+        while ((int)new_pool.size() < ps) {
             new_pool.push_back(-1);
         }
 

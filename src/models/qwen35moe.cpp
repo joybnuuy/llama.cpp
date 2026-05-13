@@ -484,28 +484,37 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 
     if (expert_pool && expert_pool->is_constrained()) {
         const auto & pool_layer = expert_pool->layers[il];
-        if (pool_layer.gate_inp)     gate_inp     = pool_layer.gate_inp;
-        if (pool_layer.up_exps)      up_exps      = pool_layer.up_exps;
-        if (pool_layer.gate_exps)    gate_exps    = pool_layer.gate_exps;
-        if (pool_layer.down_exps)    down_exps    = pool_layer.down_exps;
-        if (pool_layer.gate_up_exps && model.layers[il].ffn_gate_up_exps) gate_up_exps = pool_layer.gate_up_exps;
-        n_expert_eff = expert_pool->pool_size;
+        if (expert_pool->is_full_layer(il)) {
+            // Full layer: all 256 experts are in the pool, but we use model tensors
+            // directly since the pool is an identity mapping. The full pool exists
+            // only to avoid PCIe transfers — all expert data is already in VRAM.
+            // n_expert_eff stays at n_expert (256).
+            GGML_ASSERT(expert_pool->get_pool_size(il) == n_expert);
+        } else {
+            // Pooled layer: use pool tensors with reduced n_expert_eff
+            if (pool_layer.gate_inp)     gate_inp     = pool_layer.gate_inp;
+            if (pool_layer.up_exps)      up_exps      = pool_layer.up_exps;
+            if (pool_layer.gate_exps)    gate_exps    = pool_layer.gate_exps;
+            if (pool_layer.down_exps)    down_exps    = pool_layer.down_exps;
+            if (pool_layer.gate_up_exps && model.layers[il].ffn_gate_up_exps) gate_up_exps = pool_layer.gate_up_exps;
+            n_expert_eff = expert_pool->get_pool_size(il);
 
-        if (up_exps   != model.layers[il].ffn_up_exps)   ggml_set_input(up_exps);
-        if (gate_exps != model.layers[il].ffn_gate_exps) ggml_set_input(gate_exps);
-        if (down_exps != model.layers[il].ffn_down_exps) ggml_set_input(down_exps);
-        if (gate_inp  != model.layers[il].ffn_gate_inp)  ggml_set_input(gate_inp);
-        if (gate_up_exps && gate_up_exps != model.layers[il].ffn_gate_up_exps) ggml_set_input(gate_up_exps);
+            if (up_exps   != model.layers[il].ffn_up_exps)   ggml_set_input(up_exps);
+            if (gate_exps != model.layers[il].ffn_gate_exps) ggml_set_input(gate_exps);
+            if (down_exps != model.layers[il].ffn_down_exps) ggml_set_input(down_exps);
+            if (gate_inp  != model.layers[il].ffn_gate_inp)  ggml_set_input(gate_inp);
+            if (gate_up_exps && gate_up_exps != model.layers[il].ffn_gate_up_exps) ggml_set_input(gate_up_exps);
 
-        // Shadow full-router audit: compute top-k using ALL experts so we can measure
-        // true hit rate (overlap between full-router selections and current pool).
-        // This path is SOFT_MAX -> ARGSORT with no RESHAPE/VIEW/GET_ROWS,
-        // so it does NOT match the CUDA topk_moe fusion pattern -> tensor is readable.
-        ggml_tensor * full_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
-        ggml_tensor * full_probs  = ggml_soft_max(ctx0, full_logits);
-        ggml_tensor * full_topk  = ggml_argsort_top_k(ctx0, full_probs, n_expert_used);
-        cb(full_topk, "ffn_moe_topk_full", il);
-        ggml_build_forward_expand(gf, full_topk);
+            // Shadow full-router audit: compute top-k using ALL experts so we can measure
+            // true hit rate (overlap between full-router selections and current pool).
+            // This path is SOFT_MAX -> ARGSORT with no RESHAPE/VIEW/GET_ROWS,
+            // so it does NOT match the CUDA topk_moe fusion pattern -> tensor is readable.
+            ggml_tensor * full_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+            ggml_tensor * full_probs  = ggml_soft_max(ctx0, full_logits);
+            ggml_tensor * full_topk  = ggml_argsort_top_k(ctx0, full_probs, n_expert_used);
+            cb(full_topk, "ffn_moe_topk_full", il);
+            ggml_build_forward_expand(gf, full_topk);
+        }
     }
 
     ggml_tensor * moe_out =

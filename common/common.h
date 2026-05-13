@@ -555,6 +555,7 @@ struct common_params {
     int32_t expert_cache_n_slots = 0; // N-slot LRU expert cache: 0=off, -1=dedup-only, N>0=N GPU slots per layer (--expert-cache-slots)
     int32_t moe_pool_size        = 0; // Max experts per layer in GPU pool for sentence-level caching. 0=disabled (--moe-pool-size)
     int32_t moe_pool_refresh_budget = 5; // Max experts to copy per token during constrained backfill. 0=disable backfill
+    int32_t moe_pool_full_layers   = 0; // First N layers get all experts loaded (no pooling). 0=all layers pooled (--moe-pool-full-layers)
 
     bool single_turn       = false; // single turn chat conversation
 

@@ -37,7 +37,7 @@ struct llama_expert_pool {
     enum state { FREE_PASS, CONSTRAINED } state = FREE_PASS;
 
     // Number of bootstrap (free-pass) tokens at sentence start
-    int bootstrap_n = 3;
+    int bootstrap_n = 6;
     int free_pass_remaining = 0;
 
     // Incremented when pool changes; used for graph reuse invalidation
@@ -50,6 +50,11 @@ struct llama_expert_pool {
     // Backend buffer for pool tensors
     using ggml_backend_buffer_ptr = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>;
     ggml_backend_buffer_ptr buf{nullptr, &ggml_backend_buffer_free};
+
+    // DEBUG: mirror buffer for D2D copy verification
+    ggml_tensor * debug_mirror_up_exps = nullptr;
+    ggml_backend_buffer_ptr debug_mirror_buf{nullptr, &ggml_backend_buffer_free};
+    ggml_context_ptr debug_mirror_ctx{nullptr, &ggml_free};
 
     // Debug / stats
     struct stats {
@@ -130,13 +135,18 @@ struct llama_expert_pool {
         }
     } stats;
 
+    // Per-layer quantization types (models with mixed quantization have different types per layer)
+    struct layer_types {
+        ggml_type gate_inp     = GGML_TYPE_F32;
+        ggml_type up_exps      = GGML_TYPE_F32;
+        ggml_type gate_exps    = GGML_TYPE_F32;
+        ggml_type down_exps    = GGML_TYPE_F32;
+        ggml_type gate_up_exps = GGML_TYPE_F32;
+    };
+
     bool init(int pool_size, int n_expert, int n_layer, int n_embd, int n_ff_exp,
               ggml_backend_buffer_type_t buft,
-              ggml_type type_gate_inp,
-              ggml_type type_up_exps,
-              ggml_type type_gate_exps,
-              ggml_type type_down_exps,
-              ggml_type type_gate_up_exps,
+              const std::vector<layer_types> & types_per_layer,
               bool has_gate_up_exps);
     bool is_constrained() const { return state == CONSTRAINED && pool_size > 0; }
     bool is_free_pass() const { return state == FREE_PASS && pool_size > 0; }

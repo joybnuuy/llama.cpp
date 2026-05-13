@@ -376,37 +376,50 @@ llama_context::llama_context(
             const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : hparams.n_ff() / hparams.n_expert_used;
             // Pool MUST be on GPU for fast inference, regardless of where the source weights are.
             // Use --cpu-moe to keep full MoE weights in system RAM; only the pool lives in VRAM.
-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_cpu);
-            LLAMA_LOG_INFO("%s: searching for GPU backend in %zu backends...\n", __func__, backend_ptrs.size());
+            ggml_backend_buffer_type_t buft = nullptr;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                auto * backend = backend_ptrs[i];
-                auto dev = ggml_backend_get_device(backend);
-                auto dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
-                const char * dev_name = dev ? ggml_backend_dev_name(dev) : "null";
-                LLAMA_LOG_INFO("%s: backend[%zu] type=%d name=%s\n", __func__, i, (int)dev_type, dev_name);
-                if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    buft = ggml_backend_get_default_buffer_type(backend);
-                    LLAMA_LOG_INFO("%s: selected GPU backend[%zu] for pool buffer\n", __func__, i);
-                    break;
-                }
+                if (ggml_backend_is_cpu(backend_ptrs[i])) continue;
+                buft = backend_buft[i];
+                break;
+            }
+            if (!buft) {
+                buft = ggml_backend_get_default_buffer_type(backend_cpu);
             }
             LLAMA_LOG_INFO("%s: pool buffer type name: %s\n", __func__, ggml_backend_buft_name(buft));
             const auto & layer0 = model.layers[0];
-            ggml_type type_gate_inp    = layer0.ffn_gate_inp    ? layer0.ffn_gate_inp->type    : GGML_TYPE_F32;
-            ggml_type type_up_exps     = layer0.ffn_up_exps     ? layer0.ffn_up_exps->type     : GGML_TYPE_F32;
-            ggml_type type_gate_exps   = layer0.ffn_gate_exps   ? layer0.ffn_gate_exps->type   : GGML_TYPE_F32;
-            ggml_type type_down_exps   = layer0.ffn_down_exps   ? layer0.ffn_down_exps->type   : GGML_TYPE_F32;
-            ggml_type type_gate_up_exps = layer0.ffn_gate_up_exps ? layer0.ffn_gate_up_exps->type : GGML_TYPE_F32;
             bool has_gate_up_exps = layer0.ffn_gate_up_exps != nullptr;
+            std::vector<llama_expert_pool::layer_types> types_per_layer(hparams.n_layer);
+            for (int il = 0; il < (int)hparams.n_layer; ++il) {
+                const auto & lay = model.layers[il];
+                types_per_layer[il].gate_inp     = lay.ffn_gate_inp     ? lay.ffn_gate_inp->type     : GGML_TYPE_F32;
+                types_per_layer[il].up_exps      = lay.ffn_up_exps      ? lay.ffn_up_exps->type      : GGML_TYPE_F32;
+                types_per_layer[il].gate_exps    = lay.ffn_gate_exps    ? lay.ffn_gate_exps->type    : GGML_TYPE_F32;
+                types_per_layer[il].down_exps    = lay.ffn_down_exps    ? lay.ffn_down_exps->type    : GGML_TYPE_F32;
+                types_per_layer[il].gate_up_exps = lay.ffn_gate_up_exps ? lay.ffn_gate_up_exps->type : GGML_TYPE_F32;
+            }
             if (!expert_pool.init(params.moe_pool_size, hparams.n_expert, hparams.n_layer, hparams.n_embd, n_ff_exp,
-                                  buft, type_gate_inp, type_up_exps, type_gate_exps, type_down_exps, type_gate_up_exps,
-                                  has_gate_up_exps)) {
+                                  buft, types_per_layer, has_gate_up_exps)) {
                 LLAMA_LOG_WARN("%s: failed to initialize expert pool, disabling\n", __func__);
                 expert_pool.pool_size = 0;
             } else {
                 expert_pool.stats.start_sentence(hparams.n_layer, params.moe_pool_size);
                 LLAMA_LOG_INFO("%s: expert pool enabled (pool_size=%d). Use --cpu-moe to keep full MoE weights in system RAM.\n",
                         __func__, params.moe_pool_size);
+                // DEBUG: compare metadata between original and pool gate_inp
+                if (layer0.ffn_gate_inp && expert_pool.layers[0].gate_inp) {
+                    auto * orig = layer0.ffn_gate_inp;
+                    auto * pool = expert_pool.layers[0].gate_inp;
+                    LLAMA_LOG_INFO("META_DIFF: gate_inp orig vs pool:\n");
+                    LLAMA_LOG_INFO("  type=%d/%d, ne=[%ld,%ld,%ld,%ld]/[%ld,%ld,%ld,%ld], nb=[%zu,%zu,%zu,%zu]/[%zu,%zu,%zu,%zu]\n",
+                        (int)orig->type, (int)pool->type,
+                        orig->ne[0], orig->ne[1], orig->ne[2], orig->ne[3], pool->ne[0], pool->ne[1], pool->ne[2], pool->ne[3],
+                        orig->nb[0], orig->nb[1], orig->nb[2], orig->nb[3], pool->nb[0], pool->nb[1], pool->nb[2], pool->nb[3]);
+                    LLAMA_LOG_INFO("  data=%p/%p, buffer=%p/%p, extra=%p/%p, flags=%d/%d, op=%d/%d\n",
+                        orig->data, pool->data, (void*)orig->buffer, (void*)pool->buffer, orig->extra, pool->extra, orig->flags, pool->flags, (int)orig->op, (int)pool->op);
+                    LLAMA_LOG_INFO("  orig_buft=%s, pool_buft=%s\n",
+                        orig->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(orig->buffer)) : "null",
+                        pool->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(pool->buffer)) : "null");
+                }
             }
         }
     }
@@ -1849,6 +1862,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 expert_pool.state = llama_expert_pool::CONSTRAINED;
                 expert_pool.pool_generation++;  // invalidate graph cache for constrained rebuild
+                fprintf(stderr, "[POOL_STATE] -> CONSTRAINED gen=%llu\n", (unsigned long long)expert_pool.pool_generation);
                 LLAMA_LOG_INFO("%s: pool refreshed after %d bootstrap tokens, switching to CONSTRAINED\n",
                         __func__, expert_pool.bootstrap_n);
             }
@@ -1860,6 +1874,46 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_sched_synchronize(sched.get());
                 std::vector<std::vector<int32_t>> selected_experts;
                 read_back_experts(selected_experts);
+
+                // DEBUG: verify pool data integrity (first 3 constrained tokens only)
+                static uint64_t constrained_token_idx = 0;
+                constrained_token_idx++;
+                if (constrained_token_idx <= 3) {
+                    auto verify_pool_tensor = [&](const char * label, ggml_tensor * pl_t, ggml_tensor * ml_t, int il) {
+                        if (!pl_t || !ml_t || expert_pool.pool[il].empty()) return;
+                        bool is_3d = ml_t->ne[2] > 1;
+                        size_t src_stride = is_3d ? ml_t->nb[2] : ml_t->nb[1];
+                        size_t dst_stride = is_3d ? pl_t->nb[2] : pl_t->nb[1];
+                        size_t pool_bytes = ggml_nbytes(pl_t);
+                        std::vector<char> ref(pool_bytes, 0);
+                        std::vector<char> chk(pool_bytes);
+                        for (size_t slot = 0; slot < expert_pool.pool[il].size(); ++slot) {
+                            int32_t eid = expert_pool.pool[il][slot];
+                            if (eid < 0 || eid >= expert_pool.n_expert) continue;
+                            size_t expert_bytes = src_stride;
+                            ggml_backend_tensor_get(ml_t, ref.data() + slot * dst_stride, eid * src_stride, expert_bytes);
+                        }
+                        ggml_backend_tensor_get(pl_t, chk.data(), 0, pool_bytes);
+                        bool ok = (memcmp(ref.data(), chk.data(), pool_bytes) == 0);
+                        if (ok) {
+                            LLAMA_LOG_INFO("%s: POST-TOKEN[%llu] layer%d %s OK (%zu bytes)\n", __func__, (unsigned long long)constrained_token_idx, il, label, pool_bytes);
+                        } else {
+                            int first_diff = -1;
+                            for (size_t b = 0; b < pool_bytes; b++) { if (ref[b] != chk[b]) { first_diff = (int)b; break; } }
+                            LLAMA_LOG_ERROR("%s: POST-TOKEN[%llu] layer%d %s FAILED (%zu bytes, first_diff@%d ref=0x%02x chk=0x%02x)\n",
+                                __func__, (unsigned long long)constrained_token_idx, il, label, pool_bytes,
+                                first_diff, (unsigned char)ref[first_diff], (unsigned char)chk[first_diff]);
+                        }
+                    };
+                    int il = 0;
+                    const auto & pl = expert_pool.layers[il];
+                    const auto & ml = model.layers[il];
+                    verify_pool_tensor("up_exps",   pl.up_exps,   ml.ffn_up_exps,   il);
+                    verify_pool_tensor("gate_exps", pl.gate_exps, ml.ffn_gate_exps, il);
+                    verify_pool_tensor("down_exps", pl.down_exps, ml.ffn_down_exps, il);
+                    verify_pool_tensor("gate_inp",  pl.gate_inp,  ml.ffn_gate_inp,  il);
+                }
+
                 expert_pool.stats.record_token(false, model.hparams.n_layer, selected_experts, expert_pool.pool);
             }
 
@@ -1880,6 +1934,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 expert_pool.state = llama_expert_pool::FREE_PASS;
                 expert_pool.free_pass_remaining = expert_pool.bootstrap_n;
                 expert_pool.pool_generation++;  // invalidate graph cache for free-pass rebuild
+                fprintf(stderr, "[POOL_STATE] -> FREE_PASS gen=%llu\n", (unsigned long long)expert_pool.pool_generation);
                 LLAMA_LOG_INFO("%s: sentence boundary detected, starting %d-token bootstrap\n",
                         __func__, expert_pool.bootstrap_n);
             }
@@ -4029,11 +4084,7 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_embd_, int n_ff_exp_,
                                ggml_backend_buffer_type_t buft,
-                               ggml_type type_gate_inp,
-                               ggml_type type_up_exps,
-                               ggml_type type_gate_exps,
-                               ggml_type type_down_exps,
-                               ggml_type type_gate_up_exps,
+                               const std::vector<layer_types> & types_per_layer,
                                bool has_gate_up_exps) {
     if (pool_size_ <= 0 || n_expert_ <= 0 || n_layer_ <= 0 || n_embd_ <= 0 || n_ff_exp_ <= 0) {
         return false;
@@ -4060,24 +4111,25 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
     }
 
     for (int il = 0; il < n_layer; ++il) {
-        auto * t_gate_inp = ggml_new_tensor_2d(tmp_ctx, type_gate_inp, n_embd, pool_size);
+        const auto & t = types_per_layer[il];
+        auto * t_gate_inp = ggml_new_tensor_2d(tmp_ctx, t.gate_inp, n_embd, pool_size);
         size_t sz_gate_inp = GGML_PAD(ggml_nbytes(t_gate_inp), GGML_MEM_ALIGN);
         total_size += sz_gate_inp;
 
-        auto * t_up_exps = ggml_new_tensor_3d(tmp_ctx, type_up_exps, n_embd, n_ff_exp, pool_size);
+        auto * t_up_exps = ggml_new_tensor_3d(tmp_ctx, t.up_exps, n_embd, n_ff_exp, pool_size);
         size_t sz_up_exps = GGML_PAD(ggml_nbytes(t_up_exps), GGML_MEM_ALIGN);
         total_size += sz_up_exps;
 
-        auto * t_gate_exps = ggml_new_tensor_3d(tmp_ctx, type_gate_exps, n_embd, n_ff_exp, pool_size);
+        auto * t_gate_exps = ggml_new_tensor_3d(tmp_ctx, t.gate_exps, n_embd, n_ff_exp, pool_size);
         size_t sz_gate_exps = GGML_PAD(ggml_nbytes(t_gate_exps), GGML_MEM_ALIGN);
         total_size += sz_gate_exps;
 
-        auto * t_down_exps = ggml_new_tensor_3d(tmp_ctx, type_down_exps, n_ff_exp, n_embd, pool_size);
+        auto * t_down_exps = ggml_new_tensor_3d(tmp_ctx, t.down_exps, n_ff_exp, n_embd, pool_size);
         size_t sz_down_exps = GGML_PAD(ggml_nbytes(t_down_exps), GGML_MEM_ALIGN);
         total_size += sz_down_exps;
 
         if (has_gate_up_exps) {
-            auto * t_gate_up_exps = ggml_new_tensor_3d(tmp_ctx, type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
+            auto * t_gate_up_exps = ggml_new_tensor_3d(tmp_ctx, t.gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
             size_t sz_gate_up = GGML_PAD(ggml_nbytes(t_gate_up_exps), GGML_MEM_ALIGN);
             total_size += sz_gate_up;
         }
@@ -4100,44 +4152,60 @@ bool llama_expert_pool::init(int pool_size_, int n_expert_, int n_layer_, int n_
         return false;
     }
 
-    buf.reset(ggml_backend_buft_alloc_buffer(buft, total_size));
-    if (!buf) {
-        ctx.reset();
-        return false;
-    }
-
     layers.resize(n_layer);
     pool.resize(n_layer);
     expert_scores.resize(n_layer, std::vector<float>(n_expert, 0.0f));
 
-    char * base = (char *)ggml_backend_buffer_get_base(buf.get());
-    size_t offset = 0;
     for (int il = 0; il < n_layer; ++il) {
-        layers[il].gate_inp = ggml_new_tensor_2d(ctx.get(), type_gate_inp, n_embd, pool_size);
-        ggml_backend_tensor_alloc(buf.get(), layers[il].gate_inp, base + offset);
-        offset += GGML_PAD(ggml_nbytes(layers[il].gate_inp), GGML_MEM_ALIGN);
-
-        layers[il].up_exps = ggml_new_tensor_3d(ctx.get(), type_up_exps, n_embd, n_ff_exp, pool_size);
-        ggml_backend_tensor_alloc(buf.get(), layers[il].up_exps, base + offset);
-        offset += GGML_PAD(ggml_nbytes(layers[il].up_exps), GGML_MEM_ALIGN);
-
-        layers[il].gate_exps = ggml_new_tensor_3d(ctx.get(), type_gate_exps, n_embd, n_ff_exp, pool_size);
-        ggml_backend_tensor_alloc(buf.get(), layers[il].gate_exps, base + offset);
-        offset += GGML_PAD(ggml_nbytes(layers[il].gate_exps), GGML_MEM_ALIGN);
-
-        layers[il].down_exps = ggml_new_tensor_3d(ctx.get(), type_down_exps, n_ff_exp, n_embd, pool_size);
-        ggml_backend_tensor_alloc(buf.get(), layers[il].down_exps, base + offset);
-        offset += GGML_PAD(ggml_nbytes(layers[il].down_exps), GGML_MEM_ALIGN);
-
+        const auto & t = types_per_layer[il];
+        layers[il].gate_inp = ggml_new_tensor_2d(ctx.get(), t.gate_inp, n_embd, pool_size);
+        layers[il].up_exps = ggml_new_tensor_3d(ctx.get(), t.up_exps, n_embd, n_ff_exp, pool_size);
+        layers[il].gate_exps = ggml_new_tensor_3d(ctx.get(), t.gate_exps, n_embd, n_ff_exp, pool_size);
+        layers[il].down_exps = ggml_new_tensor_3d(ctx.get(), t.down_exps, n_ff_exp, n_embd, pool_size);
         if (has_gate_up_exps) {
-            layers[il].gate_up_exps = ggml_new_tensor_3d(ctx.get(), type_gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
-            ggml_backend_tensor_alloc(buf.get(), layers[il].gate_up_exps, base + offset);
-            offset += GGML_PAD(ggml_nbytes(layers[il].gate_up_exps), GGML_MEM_ALIGN);
+            layers[il].gate_up_exps = ggml_new_tensor_3d(ctx.get(), t.gate_up_exps, n_embd * 2, n_ff_exp, pool_size);
         } else {
             layers[il].gate_up_exps = nullptr;
         }
-
         pool[il].resize(pool_size, -1);
+    }
+
+    buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buf) {
+        ctx.reset();
+        return false;
+    }
+    // Pool tensors are persistent weights, not temporary compute buffers.
+    // COMPUTE usage caused garbage output because the allocator may reuse them.
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    total_size = ggml_backend_buffer_get_size(buf.get());
+    fprintf(stderr, "[POOL_INIT] buf=%p base=%p size=%zu buft=%s usage=WEIGHTS\n",
+        (void*)buf.get(), ggml_backend_buffer_get_base(buf.get()), total_size,
+        ggml_backend_buft_name(ggml_backend_buffer_get_type(buf.get())));
+    for (int il = 0; il < std::min(n_layer, 2); ++il) {
+        fprintf(stderr, "[POOL_INIT] layer%d up_exps data=%p buf=%p nb=[%zu,%zu,%zu,%zu]\n",
+            il, layers[il].up_exps->data, (void*)layers[il].up_exps->buffer,
+            layers[il].up_exps->nb[0], layers[il].up_exps->nb[1], layers[il].up_exps->nb[2], layers[il].up_exps->nb[3]);
+    }
+
+    // DEBUG: create mirror tensor for layer 0 up_exps to test D2D copy
+    if (layers[0].up_exps) {
+        ggml_init_params mirror_params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        debug_mirror_ctx.reset(ggml_init(mirror_params));
+        if (debug_mirror_ctx) {
+            debug_mirror_up_exps = ggml_new_tensor_3d(debug_mirror_ctx.get(), layers[0].up_exps->type,
+                                                       layers[0].up_exps->ne[0], layers[0].up_exps->ne[1], layers[0].up_exps->ne[2]);
+            debug_mirror_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(debug_mirror_ctx.get(), buft));
+            if (debug_mirror_buf) {
+                LLAMA_LOG_INFO("%s: DEBUG mirror buffer for layer0 up_exps created (%.2f MiB)\n", __func__,
+                    ggml_backend_buffer_get_size(debug_mirror_buf.get()) / 1024.0 / 1024.0);
+            }
+        }
     }
 
     state = FREE_PASS;
@@ -4182,6 +4250,16 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
         size_t expert_bytes = src->ne[2] > 1 ? src->nb[2] : src->nb[1];
 
         ggml_backend_tensor_get(src, tmp.data(), src_id * src_stride, expert_bytes);
+        {
+            size_t dst_nb = ggml_nbytes(dst);
+            size_t off = dst_slot * dst_stride;
+            if (off + expert_bytes > dst_nb) {
+                LLAMA_LOG_ERROR("[copy_expert OOB] il=%d dst=%s src=%s src_id=%d dst_slot=%d dst_stride=%zu expert_bytes=%zu dst_nb=%zu dst_ne=[%ld,%ld,%ld] dst_nb_arr=[%zu,%zu,%zu] src_ne=[%ld,%ld,%ld] src_nb_arr=[%zu,%zu,%zu]\n",
+                    il, dst->name, src->name, src_id, dst_slot, dst_stride, expert_bytes, dst_nb,
+                    dst->ne[0], dst->ne[1], dst->ne[2], dst->nb[0], dst->nb[1], dst->nb[2],
+                    src->ne[0], src->ne[1], src->ne[2], src->nb[0], src->nb[1], src->nb[2]);
+            }
+        }
         ggml_backend_tensor_set(dst, tmp.data(), dst_slot * dst_stride, expert_bytes);
     };
 
@@ -4207,6 +4285,41 @@ void llama_expert_pool::refresh_layer(int il, const llama_layer & layer, const s
             LLAMA_LOG_ERROR("%s: LAYER %d gate_inp copy verification FAILED for expert %d -> slot 0\n", __func__, il, eid);
         } else if (il == 0) {
             LLAMA_LOG_INFO("%s: LAYER %d gate_inp copy verification OK for expert %d -> slot 0\n", __func__, il, eid);
+        }
+    }
+
+    // DEBUG: full verification for layer 0 up_exps
+    if (il == 0 && pl.up_exps && layer.ffn_up_exps) {
+        size_t pool_bytes = ggml_nbytes(pl.up_exps);
+        std::vector<char> ref(pool_bytes);
+        std::vector<char> chk(pool_bytes);
+        for (size_t slot = 0; slot < new_pool.size(); ++slot) {
+            int32_t eid = new_pool[slot];
+            if (eid < 0 || eid >= n_expert) continue;
+            size_t src_stride = layer.ffn_up_exps->nb[2];
+            size_t dst_stride = pl.up_exps->nb[2];
+            size_t expert_bytes = layer.ffn_up_exps->nb[2];
+            ggml_backend_tensor_get(layer.ffn_up_exps, ref.data() + slot * dst_stride, eid * src_stride, expert_bytes);
+        }
+        ggml_backend_tensor_get(pl.up_exps, chk.data(), 0, pool_bytes);
+        bool ok = (memcmp(ref.data(), chk.data(), pool_bytes) == 0);
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: LAYER %d up_exps FULL copy verification FAILED\n", __func__, il);
+        } else {
+            LLAMA_LOG_INFO("%s: LAYER %d up_exps FULL copy verification OK (%zu bytes)\n", __func__, il, pool_bytes);
+        }
+
+        // DEBUG: test D2D copy from pool to mirror tensor
+        if (debug_mirror_up_exps && debug_mirror_buf) {
+            ggml_backend_tensor_copy(pl.up_exps, debug_mirror_up_exps);
+            std::vector<char> mirror_chk(pool_bytes);
+            ggml_backend_tensor_get(debug_mirror_up_exps, mirror_chk.data(), 0, pool_bytes);
+            bool mirror_ok = (memcmp(ref.data(), mirror_chk.data(), pool_bytes) == 0);
+            if (!mirror_ok) {
+                LLAMA_LOG_ERROR("%s: LAYER %d up_exps D2D mirror copy FAILED\n", __func__, il);
+            } else {
+                LLAMA_LOG_INFO("%s: LAYER %d up_exps D2D mirror copy OK (%zu bytes)\n", __func__, il, pool_bytes);
+            }
         }
     }
 
